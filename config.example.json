@@ -1,0 +1,17 @@
+{
+  "listen": ":8080",
+  "startPort": 10001,
+  "healthCheckTimeout": "120s",
+  "drainTimeout": "5m",
+  "models": {
+    "qwen-7b": {
+      "cmd": "llama-server -m /models/qwen2.5-7b-instruct-q4_k_m.gguf --port ${PORT} -ngl 99 -c 8192",
+      "aliases": ["gpt-4o-mini"],
+      "ttl": "10m"
+    },
+    "bge-embed": {
+      "cmd": "llama-server -m /models/bge-m3.gguf --embedding --port ${PORT}",
+      "env": ["CUDA_VISIBLE_DEVICES=0"]
+    }
+  }
+}

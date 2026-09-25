@@ -1,0 +1,39 @@
+# Address the router listens on.
+listen: ":8080"
+# Each model gets a port starting here (in model-name order), available as ${PORT}.
+startPort: 10001
+# How long to wait for a model's checkEndpoint to return 200.
+healthCheckTimeout: 120s
+# How long a swap waits for in-flight requests on the outgoing model.
+drainTimeout: 5m
+
+models:
+  qwen-7b:
+    # Macros: ${PORT}, ${MODEL_ID}. Quotes and backslash line continuations work.
+    cmd: |
+      llama-server -m /models/qwen2.5-7b-instruct-q4_k_m.gguf
+        --port ${PORT} -ngl 99 -c 8192
+    aliases: [gpt-4o-mini]
+    ttl: 10m               # unload after 10 minutes idle (0 = never)
+
+  bge-embed:
+    cmd: llama-server -m /models/bge-m3.gguf --embedding --port ${PORT}
+    env: ["CUDA_VISIBLE_DEVICES=0"]
+    # proxy: http://127.0.0.1:${PORT}   # default
+    # checkEndpoint: /health            # default; "none" to skip
+    # stopTimeout: 10s                  # SIGTERM -> SIGKILL grace period
+
+  # A job-queue server such as qwen-image-server:
+  # POST /jobs returns 202 at once and renders in the background, so the
+  # router asks /health whether it is still working before swapping it out.
+  # Reach it with /u/qwen-image/jobs, since it has no OpenAI API.
+  qwen-image:
+    cmd: uv run --directory /path/to/qwen-image-server qwen_image_server.py --port ${PORT}
+    env: ["PYTHONUNBUFFERED=1"]   # keep Python log lines in order
+    stopTimeout: 30s
+    drainTimeout: 30m             # a queue of 2K renders can take a while
+    busyCheck:
+      endpoint: /health
+      fields: [running, queued]   # busy while either is non-null / non-zero
+      # interval: 2s              # poll period while draining
+      # grace: 15s                # after work ends, wait until clients stop polling
