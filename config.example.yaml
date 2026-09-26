@@ -15,6 +15,7 @@ models:
         --port ${PORT} -ngl 99 -c 8192
     aliases: [gpt-4o-mini]
     ttl: 10m               # unload after 10 minutes idle (0 = never)
+    # disabled: true       # temporarily hide the model; it keeps its port slot
 
   bge-embed:
     cmd: llama-server -m /models/bge-m3.gguf --embedding --port ${PORT}
@@ -28,7 +29,7 @@ models:
   # router asks /health whether it is still working before swapping it out.
   # Reach it with /u/qwen-image/jobs, since it has no OpenAI API.
   qwen-image:
-    cmd: uv run --directory /path/to/qwen-image-server qwen_image_server.py --port ${PORT}
+    cmd: uv run --directory /path/to/simple-ai-server/qwen-image qwen_image_server.py --port ${PORT}
     env: ["PYTHONUNBUFFERED=1"]   # keep Python log lines in order
     stopTimeout: 30s
     drainTimeout: 30m             # a queue of 2K renders can take a while

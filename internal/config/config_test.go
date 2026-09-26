@@ -50,6 +50,35 @@ models:
 	}
 }
 
+func TestParseDisabled(t *testing.T) {
+	cfg, err := Parse([]byte(`
+startPort: 9000
+models:
+  alpha:
+    cmd: a --port ${PORT}
+    aliases: [gpt-4o]
+    disabled: true
+  beta:
+    cmd: b --port ${PORT}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := cfg.Models["alpha"]; ok {
+		t.Fatal("disabled model still present")
+	}
+	if _, ok := cfg.Resolve("alpha"); ok {
+		t.Fatal("disabled model resolved")
+	}
+	if _, ok := cfg.Resolve("gpt-4o"); ok {
+		t.Fatal("alias of disabled model resolved")
+	}
+	// The disabled model keeps its port slot so beta's port is unchanged.
+	if p := cfg.Models["beta"].Port; p != 9001 {
+		t.Fatalf("beta port = %d, want 9001", p)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	for _, tc := range []struct{ name, yaml, want string }{
 		{"no models", `listen: ":1"`, "no models"},
@@ -57,6 +86,7 @@ func TestParseErrors(t *testing.T) {
 		{"unknown field", "models:\n  a:\n    cmd: x\n    bogus: 1", "bogus"},
 		{"alias collides", "models:\n  a:\n    cmd: x\n    aliases: [b]\n  b:\n    cmd: y", "collides"},
 		{"bad quote", "models:\n  a:\n    cmd: x \"y", "unterminated"},
+		{"all disabled", "models:\n  a:\n    cmd: x\n    disabled: true", "all models are disabled"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Parse([]byte(tc.yaml))

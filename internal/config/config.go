@@ -53,6 +53,10 @@ type ModelConfig struct {
 	// BusyCheck lets servers that work in the background (job queues)
 	// report that they are busy even with no request in flight.
 	BusyCheck *BusyCheck `yaml:"busyCheck"`
+	// Disabled temporarily removes the model: it is not listed, cannot be
+	// resolved and never starts. It keeps its port slot so the other
+	// models' ports do not shift.
+	Disabled bool `yaml:"disabled"`
 
 	// Filled in by Load.
 	Name string   `yaml:"-"`
@@ -171,6 +175,10 @@ func (c *Config) finalize() error {
 		}
 		m.Name = name
 		m.Port = c.StartPort + i
+		if m.Disabled {
+			delete(c.Models, name)
+			continue
+		}
 		if m.StopTimeout == 0 {
 			m.StopTimeout = defaultStopTimeout
 		}
@@ -218,6 +226,9 @@ func (c *Config) finalize() error {
 			}
 			c.aliases[a] = name
 		}
+	}
+	if len(c.Models) == 0 {
+		return fmt.Errorf("config: all models are disabled")
 	}
 	return nil
 }
