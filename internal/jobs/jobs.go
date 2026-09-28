@@ -551,6 +551,13 @@ func (m *Manager) validate(mc *config.ModelConfig, j *Job, bodyPath string, body
 		slog.Warn("validation skipped", "model", mc.Name, "err", err)
 		return 0, nil
 	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		// The workload has no such endpoint (or not for this path): nothing
+		// to check, as with simple-ai-server.
+		slog.Warn("validation skipped: the workload has no validate endpoint", "model", mc.Name,
+			"endpoint", mc.Validate.Endpoint, "status", resp.StatusCode)
+		return 0, nil
+	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var a struct {
 			ETA float64 `json:"eta_s"`

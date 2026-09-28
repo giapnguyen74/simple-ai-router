@@ -817,3 +817,32 @@ func TestDependentsBookAfterWhatTheyWaitFor(t *testing.T) {
 		t.Fatalf("after more b: gen %d dec %d other %d", batchOf(t, gen), batchOf(t, dec), batchOf(t, other))
 	}
 }
+
+func TestIdleLoadedModelLingersWhenContentionStarts(t *testing.T) {
+	r := newRouter(t, "batch:\n  cycle: 10s\n  linger: 400ms\n", map[string]fakeserver.Model{"a": {}, "b": {}})
+	p, release := acquire(t, r, "a")
+	pid := p.Info().PID
+	release()
+	time.Sleep(700 * time.Millisecond) // idle longer than linger, nobody else waiting
+
+	var order []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	serve := func(name string) {
+		p, release := acquire(t, r, name)
+		mu.Lock()
+		order = append(order, name)
+		if name == "a" && p.Info().PID != pid {
+			order = append(order, "a-reloaded")
+		}
+		mu.Unlock()
+		release()
+	}
+	wg.Go(func() { serve("b") })
+	time.Sleep(100 * time.Millisecond) // a's client comes back within linger
+	wg.Go(func() { serve("a") })
+	wg.Wait()
+	if len(order) != 2 || order[0] != "a" {
+		t.Fatalf("order %v: a was loaded and its request came within linger", order)
+	}
+}

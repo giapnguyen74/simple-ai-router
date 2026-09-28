@@ -536,6 +536,12 @@ func (r *Router) contendedLocked(a *model) bool {
 // only one cycle of its waiting work; the rest moves to the next batch.
 func (r *Router) contentionLocked(a *model, now time.Time) {
 	r.curStart = now
+	// Its turn starts now: an idle model gets linger for its own client's
+	// next request before it yields.
+	a.turnDone, a.turnEnded = false, false
+	if a.admitted == 0 {
+		a.idleSince = now
+	}
 	if !r.turnStart.IsZero() {
 		r.turnStart = now
 	}
@@ -580,6 +586,8 @@ func (r *Router) finishTurnLocked(a *model, now time.Time) {
 	}
 	k := r.minBatchLocked()
 	if k == 0 {
+		// Nobody has work: the model stays loaded, alone again.
+		r.contended = false
 		return
 	}
 	if !a.hasWaiting(k) {

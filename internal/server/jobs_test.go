@@ -619,3 +619,15 @@ func TestJobPlaceEstimateAndBusy(t *testing.T) {
 		st.do(t, "DELETE", "/jobs/"+id, "", "")
 	}
 }
+
+func TestJobValidateMissingEndpointIsSkipped(t *testing.T) {
+	st := newJobStack(t, "", "", map[string]fakeserver.Model{
+		"a": {Extra: "validate:\n  endpoint: /no-such-route"},
+	})
+	warm := st.submit(t, "a", "job?for=10ms", `{}`)
+	st.wait(t, warm.ID) // loaded: the next submit is validated
+	v := st.submit(t, "a", "job?for=10ms", `{}`)
+	if done := st.wait(t, v.ID); done.Status != "done" {
+		t.Fatalf("job refused by a missing validate route: %+v", done)
+	}
+}
