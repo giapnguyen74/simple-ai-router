@@ -783,3 +783,37 @@ func TestLearnsDurationsAndLoadTime(t *testing.T) {
 		t.Fatalf("load time %v", l)
 	}
 }
+
+func TestDependentsBookAfterWhatTheyWaitFor(t *testing.T) {
+	r := newRouter(t, "batch:\n  cycle: 1s\n", map[string]fakeserver.Model{
+		"a": {Extra: planned}, "b": {Extra: planned}, "c": {Extra: planned},
+	})
+	_, release := acquire(t, r, "a")
+	defer release()
+	gen := enqueueJob(t, r, "b", 200*time.Millisecond)
+	dec, err := r.Enqueue("b", KindJob, Work{Path: "run", Estimate: 100 * time.Millisecond, After: []*Ticket{gen}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := r.Enqueue("c", KindJob, Work{Path: "run", Estimate: 100 * time.Millisecond, After: []*Ticket{dec}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		dec.Wait(ctx)
+		other.Wait(ctx)
+	})
+	if batchOf(t, gen) != 2 || batchOf(t, dec) != 2 || batchOf(t, other) != 3 {
+		t.Fatalf("gen %d, its same-model dependent %d, the other model's %d; want 2, 2, 3",
+			batchOf(t, gen), batchOf(t, dec), batchOf(t, other))
+	}
+	// When more b work arrives, dependents stay behind what they wait for.
+	for range 3 {
+		enqueueJob(t, r, "b", 300*time.Millisecond)
+	}
+	if batchOf(t, dec) < batchOf(t, gen) || batchOf(t, other) <= batchOf(t, dec) {
+		t.Fatalf("after more b: gen %d dec %d other %d", batchOf(t, gen), batchOf(t, dec), batchOf(t, other))
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
@@ -20,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/giapnguyen74/simple-ai-router/internal/artifacts"
 	"github.com/giapnguyen74/simple-ai-router/internal/jobs"
 	"github.com/giapnguyen74/simple-ai-router/internal/router"
 )
@@ -65,6 +67,9 @@ func New(r *router.Router, jm *jobs.Manager) (*Server, error) {
 		s.mux.HandleFunc("GET /jobs/{id}/wait", s.handleJobWait)
 		s.mux.HandleFunc("GET /jobs/{id}/result", s.handleJobResult)
 		s.mux.HandleFunc("DELETE /jobs/{id}", s.handleJobCancel)
+		s.mux.HandleFunc("POST /artifacts", s.handleArtifactPut)
+		s.mux.HandleFunc("GET /artifacts/{id}", s.handleArtifactGet)
+		s.mux.HandleFunc("DELETE /artifacts/{id}", s.handleArtifactDelete)
 	}
 	s.mux.HandleFunc("GET /running", s.handleRunning)
 	s.mux.HandleFunc("POST /unload", s.handleUnload)
@@ -307,6 +312,70 @@ func (s *Server) handleJobResult(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
 	http.ServeContent(w, r, "", info.ModTime(), f)
+}
+
+// handleArtifactPut stores an upload: the raw body (named by X-Filename), or
+// the "file" part of a multipart form.
+func (s *Server) handleArtifactPut(w http.ResponseWriter, r *http.Request) {
+	limit := int64(s.router.Config().Artifacts.MaxUpload)
+	body := http.MaxBytesReader(w, r.Body, limit+1<<20)
+	name, ctype := r.Header.Get("X-Filename"), r.Header.Get("Content-Type")
+	var src io.Reader = body
+	if mt, params, err := mime.ParseMediaType(ctype); err == nil && mt == "multipart/form-data" {
+		mr := multipart.NewReader(body, params["boundary"])
+		for {
+			part, err := mr.NextPart()
+			if err != nil {
+				writeDetail(w, http.StatusBadRequest, `multipart upload without a "file" part`)
+				return
+			}
+			if part.FormName() == "file" {
+				src, name, ctype = part, part.FileName(), part.Header.Get("Content-Type")
+				break
+			}
+		}
+	}
+	meta, err := s.jobs.Artifacts().Put(src, name, ctype, limit)
+	var tooLarge *http.MaxBytesError
+	switch {
+	case errors.Is(err, artifacts.ErrTooLarge) || errors.As(err, &tooLarge):
+		writeDetail(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds %d bytes", limit))
+		return
+	case err != nil:
+		writeDetail(w, http.StatusInternalServerError, "store upload: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, meta)
+}
+
+func (s *Server) handleArtifactGet(w http.ResponseWriter, r *http.Request) {
+	path, meta, err := s.jobs.Artifacts().Open(r.PathValue("id"))
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "no artifact "+r.PathValue("id"))
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "no artifact "+r.PathValue("id"))
+		return
+	}
+	defer f.Close()
+	ctype := meta.ContentType
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": meta.Name}))
+	w.Header().Set("ETag", `"`+meta.ID+`"`)
+	http.ServeContent(w, r, "", time.Unix(int64(meta.Created), 0), f)
+}
+
+func (s *Server) handleArtifactDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.jobs.DeleteArtifact(r.PathValue("id")); err != nil {
+		writeJobError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // writeJobError answers a job route's error: the router's own as

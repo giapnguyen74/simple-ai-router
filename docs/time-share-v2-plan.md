@@ -1,7 +1,7 @@
 # Time-share v2: batch scheduling, pipelines and an artifact cache
 
-Status: **part A implemented** (phases 0-2: `internal/router/batch.go`, `stats.go`); parts B and
-C are next. Builds on [time-share-plan.md](time-share-plan.md) (jobs). The workload side is fixed by `simple-ai-server/GUIDELINE.md`:
+Status: **parts A and B1-B3 implemented** (phases 0-4: `internal/router/batch.go`, `stats.go`,
+`internal/artifacts`, `internal/jobs/refs.go`); part C and B4 are next. Builds on [time-share-plan.md](time-share-plan.md) (jobs). The workload side is fixed by `simple-ai-server/GUIDELINE.md`:
 synchronous workers, one file per call, no queue, no stored results, and *"a later call that needs an
 earlier output gets it in its request"*. That moves two jobs onto the router: the **job queue** (done)
 and the **artifacts** that flow between calls (part B).

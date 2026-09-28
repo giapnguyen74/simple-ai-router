@@ -99,6 +99,36 @@ models:
     validate: {endpoint: /validate}
 ```
 
+### References and pipelines
+
+A job can use another job's output, or an uploaded file, without the client
+downloading and uploading it again. The router puts the file in the request
+when it sends it to the workload:
+
+```sh
+curl -XPOST localhost:8080/artifacts -H 'X-Filename: face.png' --data-binary @face.png
+                                                          # 201 {"id": "sha256:9f86...", ...}; same bytes, same id
+curl -XPOST localhost:8080/jobs/yue2/decode -F bundle@ref=job:e3969fd18827 -F format=mp3
+curl -XPOST localhost:8080/jobs/avatar/render -H 'content-type: application/json' \
+     -d '{"image": {"$ref": "artifact:9f86..."}, "audio": {"$ref": "job:7ab2c4e1d0f3"}}'
+```
+
+- multipart: a text part `<field>@ref` becomes a file part `<field>`;
+- JSON: `{"$ref": ...}` becomes the file as base64 (up to `jobs.maxInlineRef`).
+
+A reference to a job that is not done yet makes the new job `blocked` until it
+is, and fails it if that job fails, so a whole pipeline can be submitted at
+once; a blocked job is booked right after the job it waits for, in the same
+turn when both are for the same model. A finished job's output also goes into
+the artifact store (`sha256` in its view); nothing a queued or blocked job
+refers to is removed by retention. Artifacts not used for `artifacts.ttl`, or
+beyond `artifacts.maxSize`, are removed.
+
+```yaml
+jobs: {maxInlineRef: 32MB}                             # defaults
+artifacts: {maxSize: 50GB, ttl: 720h, maxUpload: 1GB}  # ttl defaults to jobs.resultTTL
+```
+
 ## Job-queue servers (legacy)
 
 Some servers accept work and finish it in the background themselves (an image
@@ -132,6 +162,8 @@ unload never stops a busy model.
 | `GET /jobs/{id}/result` | The job's output file |
 | `DELETE /jobs/{id}` | Cancel a job |
 | `GET /jobs[?model=name]` | All jobs, newest first |
+| `POST /artifacts` | Store an upload (raw body with `X-Filename`, or multipart `file`); `201` with its `sha256:` id |
+| `GET /artifacts/{id}`, `DELETE /artifacts/{id}` | Download, or remove (`409` while a queued job refers to it) |
 | `GET /running` | Per model: state, PID, in-flight count, queue length, turn, quota, load time, job counts; the booked batches, switch overhead and learned durations |
 | `POST /unload[?model=name]` | Stop the running model, or one by name |
 | `GET /health` | Router health |

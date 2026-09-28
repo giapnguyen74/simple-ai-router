@@ -34,6 +34,9 @@ const (
 	defaultResultTTL          = 30 * 24 * time.Hour
 	defaultMaxBodySize        = 64 << 20
 	defaultProgressInterval   = time.Second
+	defaultMaxInlineRef       = 32 << 20
+	defaultArtifactsMaxSize   = 50 << 30
+	defaultArtifactsMaxUpload = 1 << 30
 )
 
 type Config struct {
@@ -48,6 +51,7 @@ type Config struct {
 	// and linger batch.linger.
 	TimeShare TimeShare               `yaml:"timeShare"`
 	Jobs      Jobs                    `yaml:"jobs"`
+	Artifacts Artifacts               `yaml:"artifacts"`
 	Models    map[string]*ModelConfig `yaml:"models"`
 
 	// Warnings are problems that do not stop the router, such as deprecated
@@ -84,6 +88,21 @@ type Jobs struct {
 	ResultTTL time.Duration `yaml:"resultTTL"`
 	// MaxBodySize caps a stored job request.
 	MaxBodySize ByteSize `yaml:"maxBodySize"`
+	// MaxInlineRef caps a file put into a JSON body in place of a
+	// {"$ref": ...} (as base64).
+	MaxInlineRef ByteSize `yaml:"maxInlineRef"`
+}
+
+// Artifacts configures the store of files that jobs refer to, in
+// <jobs.dir>/.artifacts.
+type Artifacts struct {
+	// MaxSize: beyond it the least recently used artifacts are removed.
+	MaxSize ByteSize `yaml:"maxSize"`
+	// TTL removes an artifact not used for this long (default
+	// jobs.resultTTL).
+	TTL time.Duration `yaml:"ttl"`
+	// MaxUpload caps one POST /artifacts.
+	MaxUpload ByteSize `yaml:"maxUpload"`
 }
 
 // ByteSize is a byte count: a plain number, or one with a KB, MB or GB
@@ -333,6 +352,22 @@ func (c *Config) finalize(baseDir string) error {
 	}
 	if c.Jobs.ResultTTL < 0 {
 		return fmt.Errorf("config: jobs.resultTTL must not be negative")
+	}
+	if c.Jobs.MaxInlineRef == 0 {
+		c.Jobs.MaxInlineRef = defaultMaxInlineRef
+	}
+	a := &c.Artifacts
+	if a.MaxSize == 0 {
+		a.MaxSize = defaultArtifactsMaxSize
+	}
+	if a.TTL == 0 {
+		a.TTL = c.Jobs.ResultTTL
+	}
+	if a.MaxUpload == 0 {
+		a.MaxUpload = defaultArtifactsMaxUpload
+	}
+	if a.TTL < 0 {
+		return fmt.Errorf("config: artifacts.ttl must not be negative")
 	}
 
 	// Sort names so port assignment is stable across restarts.

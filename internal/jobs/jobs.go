@@ -8,6 +8,11 @@
 //	<jobs.dir>/<model>/<job id>/<file>           the workload's output
 //	<jobs.dir>/<model>/<job id>/.router/job.json the router's record
 //	<jobs.dir>/<model>/<job id>/.router/request.body  until the job ends
+//	<jobs.dir>/.artifacts/                        files jobs refer to (package artifacts)
+//
+// A request may refer to the output of another job, or to an uploaded
+// artifact, instead of carrying the file (refs.go). A job that refers to a
+// job not done yet is blocked until it is.
 package jobs
 
 import (
@@ -20,6 +25,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,6 +35,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/giapnguyen74/simple-ai-router/internal/artifacts"
 	"github.com/giapnguyen74/simple-ai-router/internal/config"
 	"github.com/giapnguyen74/simple-ai-router/internal/router"
 )
@@ -36,6 +43,7 @@ import (
 type Status string
 
 const (
+	Blocked   Status = "blocked" // waits for the jobs it refers to
 	Queued    Status = "queued"
 	Running   Status = "running"
 	Done      Status = "done"
@@ -49,6 +57,7 @@ const (
 	routerDir       = ".router"
 	recordName      = "job.json"
 	bodyName        = "request.body"
+	resolvedName    = "request.resolved"
 	maxReplySize    = 1 << 20 // a workload's JSON answer, or a validation reply
 	validateTimeout = 10 * time.Second
 	progressTimeout = 2 * time.Second
@@ -80,7 +89,13 @@ type Job struct {
 	File           string          `json:"file,omitempty"`
 	Error          string          `json:"error,omitempty"`
 	UpstreamStatus int             `json:"upstream_status,omitempty"`
+	// Refs are the references in the request; DependsOn the jobs among them.
+	Refs      []string `json:"refs,omitempty"`
+	DependsOn []string `json:"depends_on,omitempty"`
+	// Sha256 is the output's id in the artifact store.
+	Sha256 string `json:"sha256,omitempty"`
 
+	pending   map[string]bool // jobs it waits for
 	cancel    context.CancelFunc
 	cancelled bool // DELETE was called
 	ticket    *router.Ticket
@@ -107,6 +122,8 @@ type View struct {
 	File           *string         `json:"file"`
 	Error          *string         `json:"error"`
 	UpstreamStatus *int            `json:"upstream_status"`
+	DependsOn      []string        `json:"depends_on,omitempty"`
+	Sha256         *string         `json:"sha256,omitempty"`
 }
 
 // Error is a refusal by the router, with the HTTP status to answer.
@@ -151,10 +168,14 @@ type Manager struct {
 	// client runs jobs: no timeout of its own.
 	client *http.Client
 
-	mu     sync.Mutex
-	jobs   map[string]*Job
-	order  []*Job // oldest first
-	closed bool
+	store *artifacts.Store
+
+	mu    sync.Mutex
+	jobs  map[string]*Job
+	order []*Job // oldest first
+	// dependents are the blocked jobs waiting for a job, by its id.
+	dependents map[string][]*Job
+	closed     bool
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -171,6 +192,9 @@ func New(rt *router.Router) (*Manager, error) {
 		client: &http.Client{Transport: &http.Transport{DisableCompression: true}},
 		jobs:   make(map[string]*Job),
 		stop:   make(chan struct{}),
+		store:  artifacts.New(cfg.Jobs.Dir, int64(cfg.Artifacts.MaxSize), cfg.Artifacts.TTL),
+
+		dependents: make(map[string][]*Job),
 	}
 	if err := m.load(); err != nil {
 		return nil, err
@@ -252,15 +276,33 @@ func (m *Manager) Submit(req Request) (*View, error) {
 		}
 	}()
 
-	size, err := storeBody(filepath.Join(dir, routerDir, bodyName), req.Body, limit)
+	bodyPath := filepath.Join(dir, routerDir, bodyName)
+	size, err := storeBody(bodyPath, req.Body, limit)
 	if err != nil {
 		return nil, err
 	}
 	j.BodySize = size
+	if j.Refs, err = findRefs(bodyPath, j.ContentType); err != nil {
+		return nil, errorf(http.StatusBadRequest, "%v", err)
+	}
+	m.mu.Lock()
+	pending, rerr := m.checkRefsLocked(j)
+	m.mu.Unlock()
+	if rerr != nil {
+		return nil, rerr
+	}
 
-	estimate, err := m.validate(mc, j)
-	if err != nil {
-		return nil, err
+	var estimate time.Duration
+	if len(pending) == 0 {
+		// Everything it refers to exists: the workload can check the
+		// request as it will receive it.
+		path, size, err := m.resolve(j)
+		if err != nil {
+			return nil, errorf(http.StatusUnprocessableEntity, "%v", err)
+		}
+		if estimate, err = m.validate(mc, j, path, size); err != nil {
+			return nil, err
+		}
 	}
 
 	m.mu.Lock()
@@ -268,7 +310,15 @@ func (m *Manager) Submit(req Request) (*View, error) {
 	if m.closed {
 		return nil, errorf(http.StatusServiceUnavailable, "router is shutting down")
 	}
-	t, err := m.rt.Enqueue(mc.Name, router.KindJob, router.Work{Path: j.Path, Estimate: estimate})
+	// Dependencies may have finished meanwhile.
+	if pending, rerr = m.checkRefsLocked(j); rerr != nil {
+		return nil, rerr
+	}
+	var after []*router.Ticket
+	for _, d := range pending {
+		after = append(after, d.ticket)
+	}
+	t, err := m.rt.Enqueue(mc.Name, router.KindJob, router.Work{Path: j.Path, Estimate: estimate, After: after})
 	if err != nil {
 		var busy *router.BusyError
 		switch {
@@ -291,8 +341,147 @@ func (m *Manager) Submit(req Request) (*View, error) {
 		return nil, errorf(http.StatusInternalServerError, "store job: %v", err)
 	}
 	keep = true
+	m.waitForLocked(j, pending)
 	m.startLocked(j, t)
 	return m.viewLocked(j), nil
+}
+
+// checkRefsLocked checks the job's references and returns the jobs it has to
+// wait for.
+func (m *Manager) checkRefsLocked(j *Job) ([]*Job, error) {
+	var pending []*Job
+	j.DependsOn = nil
+	seen := map[string]bool{}
+	for _, ref := range j.Refs {
+		kind, id, _ := parseRef(ref)
+		if kind == refArtifact {
+			if !m.store.Has(id) {
+				return nil, errorf(http.StatusUnprocessableEntity, "unknown artifact %s", id)
+			}
+			continue
+		}
+		d, ok := m.jobs[id]
+		if !ok {
+			return nil, errorf(http.StatusUnprocessableEntity, "unknown job %s", id)
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		j.DependsOn = append(j.DependsOn, id)
+		switch d.Status {
+		case Done:
+		case Failed, Cancelled:
+			return nil, errorf(http.StatusUnprocessableEntity, "job %s is %s", id, d.Status)
+		default:
+			pending = append(pending, d)
+		}
+	}
+	return pending, nil
+}
+
+// waitForLocked blocks the job until the pending jobs are done.
+func (m *Manager) waitForLocked(j *Job, pending []*Job) {
+	if len(pending) == 0 {
+		return
+	}
+	j.Status = Blocked
+	j.pending = make(map[string]bool, len(pending))
+	for _, d := range pending {
+		j.pending[d.ID] = true
+		m.dependents[d.ID] = append(m.dependents[d.ID], j)
+	}
+	m.saveLogged(j)
+}
+
+// settleLocked tells the jobs waiting for j that it finished: they are
+// queued once everything they wait for is done, and fail when j did not
+// succeed.
+func (m *Manager) settleLocked(j *Job) {
+	waiting := m.dependents[j.ID]
+	delete(m.dependents, j.ID)
+	for _, d := range waiting {
+		if d.Status.Terminal() {
+			continue
+		}
+		if j.Status != Done {
+			d.Status, d.Finished = Failed, now()
+			d.Error = fmt.Sprintf("dependency %s is %s", j.ID, j.Status)
+			m.cleanFiles(d)
+			m.saveLogged(d)
+			d.cancel()
+			d.doneOnce.Do(func() { close(d.done) })
+			m.settleLocked(d)
+			continue
+		}
+		delete(d.pending, j.ID)
+		if len(d.pending) == 0 && d.Status == Blocked {
+			d.Status = Queued
+			m.saveLogged(d)
+			d.ticket.Unblock()
+		}
+	}
+}
+
+// resolve returns the body to send to the workload: the stored one, or for a
+// request with references a copy with the files put in.
+func (m *Manager) resolve(j *Job) (string, int64, error) {
+	dir := filepath.Join(m.jobDir(j), routerDir)
+	if len(j.Refs) == 0 {
+		return filepath.Join(dir, bodyName), j.BodySize, nil
+	}
+	dst := filepath.Join(dir, resolvedName)
+	n, err := rewrite(filepath.Join(dir, bodyName), dst, j.ContentType, m.lookup, int64(m.cfg.Jobs.MaxInlineRef))
+	if err != nil {
+		return "", 0, fmt.Errorf("resolve references: %v", err)
+	}
+	return dst, n, nil
+}
+
+// lookup finds the file a reference points to.
+func (m *Manager) lookup(ref string) (file, error) {
+	kind, id, err := parseRef(ref)
+	if err != nil {
+		return file{}, err
+	}
+	if kind == refJob {
+		m.mu.Lock()
+		d, ok := m.jobs[id]
+		var status Status
+		var path, name, sha string
+		if ok {
+			status, name, sha = d.Status, d.File, d.Sha256
+			path = filepath.Join(m.jobDir(d), d.File)
+		}
+		m.mu.Unlock()
+		if !ok || status != Done {
+			return file{}, fmt.Errorf("job %s has no output (%s)", id, status)
+		}
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+			return file{path, name, contentTypeOf(name), info.Size()}, nil
+		}
+		if sha == "" {
+			return file{}, fmt.Errorf("the output of job %s is gone", id)
+		}
+		id = sha
+	}
+	path, meta, err := m.store.Open(id)
+	if err != nil {
+		return file{}, fmt.Errorf("artifact %s: %v", id, err)
+	}
+	ctype := meta.ContentType
+	if ctype == "" {
+		ctype = contentTypeOf(meta.Name)
+	}
+	return file{path, meta.Name, ctype, meta.Size}, nil
+}
+
+// contentTypeOf guesses a content type from a file name.
+func contentTypeOf(name string) string {
+	if t := mime.TypeByExtension(filepath.Ext(name)); t != "" {
+		return t
+	}
+	return "application/octet-stream"
 }
 
 // storeBody streams the body to a file and refuses one over the limit.
@@ -323,7 +512,7 @@ func storeBody(path string, body io.Reader, limit int64) (int64, error) {
 // the workload's own estimate of its run time (eta_s in the answer) when it
 // gives one. It never starts or swaps a model: when the model is not ready,
 // or does not answer in time, the job is queued unchecked.
-func (m *Manager) validate(mc *config.ModelConfig, j *Job) (time.Duration, error) {
+func (m *Manager) validate(mc *config.ModelConfig, j *Job, bodyPath string, bodySize int64) (time.Duration, error) {
 	if mc.Validate == nil {
 		return 0, nil
 	}
@@ -331,7 +520,7 @@ func (m *Manager) validate(mc *config.ModelConfig, j *Job) (time.Duration, error
 	if !ready {
 		return 0, nil
 	}
-	body, err := os.Open(filepath.Join(m.jobDir(j), routerDir, bodyName))
+	body, err := os.Open(bodyPath)
 	if err != nil {
 		return 0, nil
 	}
@@ -346,7 +535,7 @@ func (m *Manager) validate(mc *config.ModelConfig, j *Job) (time.Duration, error
 	if err != nil {
 		return 0, nil
 	}
-	req.ContentLength = j.BodySize
+	req.ContentLength = bodySize
 	if j.ContentType != "" {
 		req.Header.Set("Content-Type", j.ContentType)
 	}
@@ -458,7 +647,17 @@ func (m *Manager) run(ctx context.Context, j *Job, t *router.Ticket) {
 	if mc.Progress != nil {
 		poll.Go(func() { m.pollProgress(pollCtx, mc, j) })
 	}
-	status, reply, err := m.call(runCtx, p.Config().Proxy, j)
+	var status int
+	var reply []byte
+	bodyPath, bodySize, err := m.resolve(j)
+	if err == nil {
+		status, reply, err = m.call(runCtx, p.Config().Proxy, j, bodyPath, bodySize)
+	} else {
+		stopPoll()
+		poll.Wait()
+		m.finish(j, Failed, func() { j.Error = err.Error() })
+		return
+	}
 	stopPoll()
 	poll.Wait()
 
@@ -496,16 +695,24 @@ func (m *Manager) run(ctx context.Context, j *Job, t *router.Ticket) {
 		})
 		return
 	}
+	// The output joins the artifact store, so a job that refers to it still
+	// finds it after this job's folder is gone.
+	var sha string
+	if meta, err := m.store.Link(filepath.Join(m.jobDir(j), file), file, contentTypeOf(file)); err != nil {
+		slog.Warn("store job output", "job", j.ID, "err", err)
+	} else {
+		sha, _ = artifacts.ParseID(meta.ID)
+	}
 	m.finish(j, Done, func() {
 		j.UpstreamStatus = status
-		j.File, j.Result = file, result
+		j.File, j.Result, j.Sha256 = file, result, sha
 	})
 }
 
 // call replays the stored request to the workload.
-func (m *Manager) call(ctx context.Context, proxy string, j *Job) (int, []byte, error) {
+func (m *Manager) call(ctx context.Context, proxy string, j *Job, bodyPath string, bodySize int64) (int, []byte, error) {
 	dir := m.jobDir(j)
-	body, err := os.Open(filepath.Join(dir, routerDir, bodyName))
+	body, err := os.Open(bodyPath)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -518,8 +725,8 @@ func (m *Manager) call(ctx context.Context, proxy string, j *Job) (int, []byte, 
 	if err != nil {
 		return 0, nil, err
 	}
-	req.ContentLength = j.BodySize
-	if j.BodySize == 0 {
+	req.ContentLength = bodySize
+	if bodySize == 0 {
 		req.Body = http.NoBody
 	}
 	if j.ContentType != "" {
@@ -688,6 +895,7 @@ func (m *Manager) finish(j *Job, status Status, set func()) {
 	final := j.Status
 	m.cleanFiles(j)
 	m.saveLogged(j)
+	m.settleLocked(j)
 	m.mu.Unlock()
 
 	j.doneOnce.Do(func() { close(j.done) })
@@ -700,6 +908,7 @@ func (m *Manager) finish(j *Job, status Status, set func()) {
 func (m *Manager) cleanFiles(j *Job) {
 	dir := m.jobDir(j)
 	os.Remove(filepath.Join(dir, routerDir, bodyName))
+	os.Remove(filepath.Join(dir, routerDir, resolvedName))
 	if j.Status == Done {
 		return
 	}
@@ -730,6 +939,7 @@ func (m *Manager) Cancel(id string) (*View, error) {
 	j.Status, j.Finished = Cancelled, now()
 	m.saveLogged(j)
 	j.cancel()
+	m.settleLocked(j)
 	v := m.viewLocked(j)
 	m.mu.Unlock()
 	j.doneOnce.Do(func() { close(j.done) })
@@ -848,14 +1058,18 @@ func (m *Manager) viewLocked(j *Job) *View {
 	if j.UpstreamStatus != 0 {
 		v.UpstreamStatus = &j.UpstreamStatus
 	}
+	v.DependsOn = j.DependsOn
+	if j.Sha256 != "" {
+		v.Sha256 = &j.Sha256
+	}
 	switch j.Status {
-	case Queued:
+	case Queued, Blocked:
 		pos := 0
 		for _, o := range m.order {
 			if o == j {
 				break
 			}
-			if o.Model == j.Model && o.Status == Queued {
+			if o.Model == j.Model && (o.Status == Queued || o.Status == Blocked) {
 				pos++
 			}
 		}
@@ -931,16 +1145,28 @@ func (m *Manager) load() error {
 		switch j.Status {
 		case Running:
 			j.Status, j.Finished, j.Error = Failed, now(), ErrRestarted
-		case Queued:
+		case Queued, Blocked:
 			if _, err := os.Stat(filepath.Join(m.jobDir(j), routerDir, bodyName)); err != nil {
 				j.Status, j.Finished, j.Error = Failed, now(), "stored request is missing"
 				break
 			}
-			t, err := m.rt.Requeue(j.Model, router.KindJob, router.Work{Path: j.Path})
+			// The jobs it depends on were created before it: loaded already.
+			pending, err := m.checkRefsLocked(j)
 			if err != nil {
 				j.Status, j.Finished, j.Error = Failed, now(), err.Error()
 				break
 			}
+			var after []*router.Ticket
+			for _, d := range pending {
+				after = append(after, d.ticket)
+			}
+			t, err := m.rt.Requeue(j.Model, router.KindJob, router.Work{Path: j.Path, After: after})
+			if err != nil {
+				j.Status, j.Finished, j.Error = Failed, now(), err.Error()
+				break
+			}
+			j.Status = Queued
+			m.waitForLocked(j, pending)
 			m.startLocked(j, t)
 			requeued++
 			continue
@@ -977,7 +1203,7 @@ func (m *Manager) Sweep(at time.Time) {
 				old = append(old, j)
 			}
 		}
-		m.dropLocked(old)
+		removed += m.dropLocked(old)
 		known := make(map[string]bool)
 		for _, j := range m.order {
 			if j.Model == name {
@@ -985,7 +1211,6 @@ func (m *Manager) Sweep(at time.Time) {
 			}
 		}
 		m.mu.Unlock()
-		removed += len(old)
 
 		entries, err := os.ReadDir(filepath.Join(m.dir, name))
 		if err != nil {
@@ -1007,6 +1232,51 @@ func (m *Manager) Sweep(at time.Time) {
 	if removed > 0 {
 		slog.Info("retention: removed old jobs", "jobs", removed)
 	}
+	m.mu.Lock()
+	_, shas := m.pinnedLocked()
+	m.mu.Unlock()
+	m.store.Sweep(at, func(sha string) bool { return shas[sha] })
+}
+
+// pinnedLocked is what jobs not finished yet refer to: those jobs, and the
+// artifacts (their outputs' included). Retention keeps them.
+func (m *Manager) pinnedLocked() (jobs, shas map[string]bool) {
+	jobs, shas = map[string]bool{}, map[string]bool{}
+	for _, j := range m.order {
+		if j.Status.Terminal() {
+			continue
+		}
+		for _, ref := range j.Refs {
+			kind, id, _ := parseRef(ref)
+			if kind == refArtifact {
+				shas[id] = true
+				continue
+			}
+			jobs[id] = true
+			if d := m.jobs[id]; d != nil && d.Sha256 != "" {
+				shas[d.Sha256] = true
+			}
+		}
+	}
+	return jobs, shas
+}
+
+// Artifacts is the store of files jobs refer to.
+func (m *Manager) Artifacts() *artifacts.Store { return m.store }
+
+// DeleteArtifact removes an artifact no queued or blocked job refers to.
+func (m *Manager) DeleteArtifact(id string) error {
+	m.mu.Lock()
+	_, shas := m.pinnedLocked()
+	m.mu.Unlock()
+	err := m.store.Delete(id, func(sha string) bool { return shas[sha] })
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, artifacts.ErrNotFound):
+		return errorf(http.StatusNotFound, "no artifact %s", id)
+	}
+	return errorf(http.StatusConflict, "%v", err)
 }
 
 // prune keeps only the model's newest keepJobs finished jobs.
@@ -1030,11 +1300,20 @@ func (m *Manager) prune(model string) {
 	m.dropLocked(finished[keep:])
 }
 
-// dropLocked forgets the jobs and deletes their folders.
-func (m *Manager) dropLocked(jobs []*Job) {
+// dropLocked forgets the jobs and deletes their folders, except the jobs a
+// job not finished yet refers to.
+func (m *Manager) dropLocked(jobs []*Job) int {
 	if len(jobs) == 0 {
-		return
+		return 0
 	}
+	pinned, _ := m.pinnedLocked()
+	unpinned := jobs[:0:0]
+	for _, j := range jobs {
+		if !pinned[j.ID] {
+			unpinned = append(unpinned, j)
+		}
+	}
+	jobs = unpinned
 	drop := make(map[*Job]bool, len(jobs))
 	for _, j := range jobs {
 		drop[j] = true
@@ -1053,4 +1332,5 @@ func (m *Manager) dropLocked(jobs []*Job) {
 		m.order[i] = nil
 	}
 	m.order = kept
+	return len(jobs)
 }

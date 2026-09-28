@@ -17,6 +17,12 @@ jobs:
   dir: ./jobs             # relative to this file
   resultTTL: 720h         # delete a finished job after 30 days
   maxBodySize: 64MB       # per stored request
+  maxInlineRef: 32MB      # largest file put into a JSON body for a {"$ref": ...}
+# Files jobs refer to (uploads and job outputs), in <jobs.dir>/.artifacts.
+artifacts:
+  maxSize: 50GB           # least recently used removed beyond this
+  # ttl: 720h             # removed when unused this long (default jobs.resultTTL)
+  maxUpload: 1GB          # per POST /artifacts
 
 models:
   qwen-7b:

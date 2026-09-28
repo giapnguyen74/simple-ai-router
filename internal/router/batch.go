@@ -43,6 +43,60 @@ func (m *model) hasWaiting(k int) bool {
 	return false
 }
 
+// hasRunnable reports whether m has waiting tickets in batch k (or earlier)
+// that can be admitted now: not blocked by a dependency.
+func (m *model) hasRunnable(k int) bool {
+	for _, t := range m.queue {
+		if t.batch > k {
+			return false
+		}
+		if !t.blocked {
+			return true
+		}
+	}
+	return false
+}
+
+// minAfter is the earliest batch a ticket may be booked in because of its
+// dependencies: the batch of a waiting one, or the one after it when it
+// belongs to another model (whose turn may come later in that batch).
+func (t *Ticket) minAfter() int {
+	k := 0
+	for _, d := range t.after {
+		if d.state != ticketWaiting {
+			continue
+		}
+		dk := d.batch
+		if d.m != t.m {
+			dk++
+		}
+		k = max(k, dk)
+	}
+	return k
+}
+
+// fixDepsLocked moves tickets booked before what they depend on (after the
+// dependency itself moved) later, with the model's tickets behind them.
+func (r *Router) fixDepsLocked() {
+	for range 100 {
+		changed := false
+		for _, m := range r.models {
+			floor := 0
+			for _, t := range m.queue {
+				floor = max(floor, t.minAfter())
+				if t.batch < floor {
+					t.batch = floor
+					changed = true
+				}
+				floor = max(floor, t.batch)
+			}
+		}
+		if !changed {
+			return
+		}
+	}
+}
+
 // lastBatch is the batch of m's last waiting ticket, 0 when none waits.
 func (m *model) lastBatch() int {
 	if len(m.queue) == 0 {
@@ -148,7 +202,7 @@ type move struct {
 // whole part still runs, alone. Models over their part of that batch then
 // move their last tickets to the next one.
 func (r *Router) bookLocked(m *model, t *Ticket) []move {
-	k := max(r.cur+1, m.lastBatch())
+	k := max(r.cur+1, m.lastBatch(), t.minAfter())
 	for ; ; k++ {
 		demand := r.demandLocked(k)
 		if demand[m] == 0 {
@@ -164,7 +218,9 @@ func (r *Router) bookLocked(m *model, t *Ticket) []move {
 	}
 	t.batch = k
 	m.queue = append(m.queue, t)
-	return r.rebalanceLocked(k)
+	moves := r.rebalanceLocked(k)
+	r.fixDepsLocked()
+	return moves
 }
 
 func (r *Router) hasGuessLocked(m *model, k int, path string) bool {
@@ -226,6 +282,7 @@ func (r *Router) pushBackLocked(m *model) {
 	}
 	if pushed {
 		r.rebalanceLocked(r.cur + 1)
+		r.fixDepsLocked()
 	}
 }
 
@@ -238,7 +295,7 @@ func (r *Router) joinLocked(m *model, t *Ticket, now time.Time) bool {
 	if r.active == m && !r.yielding && !r.contendedLocked(m) {
 		return true
 	}
-	if r.cur == 0 || m.turnDone || m.lastBatch() > r.cur {
+	if r.cur == 0 || m.turnDone || m.lastBatch() > r.cur || t.minAfter() > r.cur {
 		return false
 	}
 	switch {

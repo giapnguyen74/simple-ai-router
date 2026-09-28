@@ -58,6 +58,9 @@ type Work struct {
 	// NoWaitLimit skips the maxWait and syncMaxWait refusals (work the router
 	// already accepted).
 	NoWaitLimit bool
+	// After are the tickets of the jobs this work depends on. The ticket is
+	// booked after them and blocked (never admitted) until Unblock.
+	After []*Ticket
 }
 
 type ticketState int
@@ -91,6 +94,9 @@ type Ticket struct {
 	// start is when the work began (model ready); noSample skips learning.
 	start    time.Time
 	noSample bool
+	// after are the tickets it depends on; blocked until they are done.
+	after   []*Ticket
+	blocked bool
 }
 
 // model is the scheduler's view of one configured model.
@@ -236,7 +242,8 @@ func (r *Router) enqueueLocked(m *model, kind Kind, force bool, w Work) (*Ticket
 		return nil, ErrQueueFull
 	}
 	now := time.Now()
-	t := &Ticket{r: r, m: m, kind: kind, path: w.Path, enq: now, admitted: make(chan struct{}), estimate: w.Estimate}
+	t := &Ticket{r: r, m: m, kind: kind, path: w.Path, enq: now, admitted: make(chan struct{}), estimate: w.Estimate,
+		after: w.After, blocked: len(w.After) > 0}
 	t.cost, t.guess = r.costLocked(m, w)
 	if r.joinLocked(m, t, now) {
 		t.batch = r.cur
@@ -346,6 +353,19 @@ func (t *Ticket) Wait(ctx context.Context) (p *process.Process, release func(), 
 	return t.m.p, t.release, nil
 }
 
+// Unblock lets a ticket booked with After be admitted: its dependencies are
+// done.
+func (t *Ticket) Unblock() {
+	r := t.r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !t.blocked {
+		return
+	}
+	t.blocked = false
+	r.scheduleLocked()
+}
+
 // NoSample keeps the ticket's run out of what the router learns: the work
 // failed and its duration says nothing about the next one.
 func (t *Ticket) NoSample() {
@@ -420,7 +440,7 @@ func remove(ts []*Ticket, t *Ticket) []*Ticket {
 }
 
 func (r *Router) markIdleLocked(m *model) {
-	if m.admitted == 0 && !m.hasWaiting(r.cur) {
+	if m.admitted == 0 && !m.hasRunnable(r.cur) {
 		m.idleSince = time.Now()
 	}
 }
@@ -481,7 +501,7 @@ func (r *Router) scheduleLocked() {
 	if !a.turnEnded {
 		r.admitLocked(a)
 	}
-	if a.admitted == 0 && !a.hasWaiting(r.cur) {
+	if a.admitted == 0 && !a.hasRunnable(r.cur) {
 		if !a.turnEnded {
 			// Nothing left in its turn: wait linger for work that joins.
 			end := a.idleSince.Add(*a.cfg.Linger)
@@ -523,17 +543,19 @@ func (r *Router) contentionLocked(a *model, now time.Time) {
 	for _, t := range a.running {
 		work += t.remaining(now)
 	}
+	over := false
 	for _, t := range a.queue {
 		if t.batch > r.cur {
 			break
 		}
-		if work+t.cost > r.cfg.Batch.Cycle && (work > 0 || a.admitted > 0) {
-			t.batch = r.cur + 1
+		if over || work+t.cost > r.cfg.Batch.Cycle && (work > 0 || a.admitted > 0) {
+			t.batch, over = r.cur+1, true // and every later one: arrival order
 			continue
 		}
 		work += t.cost
 	}
 	r.rebalanceLocked(r.cur + 1)
+	r.fixDepsLocked()
 	a.quota = max(work, tolerance)
 	a.turnAdmits = a.admitted
 	r.order = []*model{a}
@@ -613,7 +635,7 @@ func (r *Router) admitLocked(a *model) {
 	kept := a.queue[:0]
 	for _, t := range a.queue {
 		full := a.cfg.Concurrency > 0 && a.admitted >= a.cfg.Concurrency
-		if t.batch > r.cur || full || (t.kind == KindJob && a.admittedJobs >= jobSlots) {
+		if t.batch > r.cur || t.blocked || full || (t.kind == KindJob && a.admittedJobs >= jobSlots) {
 			kept = append(kept, t)
 			continue
 		}
