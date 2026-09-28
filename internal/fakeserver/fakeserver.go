@@ -20,7 +20,8 @@
 //	                ?steps=N sets what /progress reports
 //	POST /fail      answers ?status= (default 500) with {"detail": ...};
 //	                ?detail=list makes the detail a list
-//	POST /validate  422 when the body contains "invalid", else 200
+//	POST /validate  422 when the body contains "invalid", else 200, with
+//	                {"eta_s": N} when the JSON body has "eta": N
 //	GET  /progress  {"busy", "id", "phase", "step", "steps", "eta_s"}
 //	GET  /stats     counters: jobs, disconnects, validates, maxConcurrent
 package fakeserver
@@ -81,6 +82,13 @@ func (wl *workload) register(mux *http.ServeMux) {
 		wl.mu.Unlock()
 		if strings.Contains(string(body), "invalid") {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "invalid request"})
+			return
+		}
+		var req struct {
+			ETA float64 `json:"eta"`
+		}
+		if json.Unmarshal(body, &req) == nil && req.ETA > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"eta_s": req.ETA})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{})

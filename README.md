@@ -5,11 +5,12 @@ A single-binary, OpenAI-compatible proxy that launches inference servers
 [llama-swap](https://github.com/mostlygeek/llama-swap).
 
 A request's `model` field selects the model. Only one model runs at a time:
-work for the other models waits in the router, and a time-share scheduler
-decides when to swap (stop the running model with SIGTERM, then SIGKILL, start
-the next, wait for its health check). Models with no OpenAI API get an
+work for the other models waits in the router, and a batch scheduler decides
+when to swap (stop the running model with SIGTERM, then SIGKILL, start the
+next, wait for its health check). Models with no OpenAI API get an
 asynchronous **job** API from the router: submit a request, poll, fetch the
-file. See [docs/time-share-plan.md](docs/time-share-plan.md) for the design.
+file. See [docs/time-share-v2-plan.md](docs/time-share-v2-plan.md) for the
+scheduler and [docs/time-share-plan.md](docs/time-share-plan.md) for jobs.
 
 ## Usage
 
@@ -31,21 +32,39 @@ curl localhost:8080/v1/chat/completions \
 
 ## Scheduling
 
-Every request is a ticket in its model's FIFO queue. A model that is alone
-keeps the GPU until its `ttl`. When several models have work, each gets a
-slice of `timeShare.period` in proportion to its `share` (at least
-`minSlice`); an idle model yields after `linger`. Per model, `concurrency`
-caps what runs at once, `maxQueue` refuses more waiting requests with `429`,
-and `queueTimeout` gives up with `503`.
+Every request is a ticket, **booked into a batch** when it arrives. A batch is
+about `batch.cycle` long and is shared, by `share`, among the models booked in
+it; each model runs its part in one turn, so it is loaded at most once per
+batch, and the model already loaded goes first in the next batch.
+
+- A ticket costs its estimate: the workload's `eta_s` from `validate`, else
+  the learned duration of its model and path, else `defaultEta`. What the
+  router learns (durations, load times) is kept in `<jobs.dir>/.router/stats.json`.
+- A newcomer takes its part of the next batch; a model over its part (a
+  flood) has its last tickets moved to later batches.
+- Tickets booked in the running batch always run in it. New work joins the
+  running batch only for a model whose turn is not over and only in time no
+  one booked; otherwise it books a later batch.
+- A model that is alone is never stopped and admits everything at once.
+- A turn that overruns its part is paid back from the model's next turn.
+
+`GET /jobs/{id}` shows a queued job's `batch` (1 = running) and `starts_in_s`.
+A `/v1` request that would wait longer than `syncMaxWait` gets `503`, and a job
+predicted to start after `maxWait` gets `429`, both with `Retry-After`. Per
+model, `concurrency` caps what runs at once, `maxQueue` refuses more waiting
+requests with `429`, and `queueTimeout` gives up with `503`.
 
 ```yaml
-timeShare: {period: 10m, minSlice: 1m, linger: 2s}   # defaults
+batch: {cycle: 15m, linger: 2s}   # defaults
 models:
   qwen-7b:
     share: 3
     concurrency: 4
-    maxQueue: 100
-    queueTimeout: 30m
+    syncMaxWait: 1m
+  yue2:
+    defaultEta: 5m      # until its paths' durations are learned
+    loadTime: 60s       # until a load is measured
+    maxWait: 2h
 ```
 
 ## Jobs
@@ -113,7 +132,7 @@ unload never stops a busy model.
 | `GET /jobs/{id}/result` | The job's output file |
 | `DELETE /jobs/{id}` | Cancel a job |
 | `GET /jobs[?model=name]` | All jobs, newest first |
-| `GET /running` | State, PID, in-flight count, queue length, slice and job counts per model |
+| `GET /running` | Per model: state, PID, in-flight count, queue length, turn, quota, load time, job counts; the booked batches, switch overhead and learned durations |
 | `POST /unload[?model=name]` | Stop the running model, or one by name |
 | `GET /health` | Router health |
 

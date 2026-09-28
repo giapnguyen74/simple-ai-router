@@ -71,6 +71,8 @@ type view struct {
 	Path           string         `json:"path"`
 	Status         string         `json:"status"`
 	Position       *int           `json:"position"`
+	Batch          *int           `json:"batch"`
+	StartsIn       *int           `json:"starts_in_s"`
 	ETA            *int           `json:"eta_s"`
 	Started        *float64       `json:"started"`
 	Finished       *float64       `json:"finished"`
@@ -559,13 +561,61 @@ func TestJobsConfigDefaults(t *testing.T) {
 	}
 	m := cfg.Models["a"]
 	if cfg.Jobs.ResultTTL != 30*24*time.Hour || cfg.Jobs.MaxBodySize != 64<<20 || !filepath.IsAbs(cfg.Jobs.Dir) ||
-		m.MaxBodySize != 2<<20 || *m.Linger != 3*time.Second || *cfg.TimeShare.Linger != 2*time.Second || m.ResultTTL != cfg.Jobs.ResultTTL || m.Share != 1 {
+		m.MaxBodySize != 2<<20 || *m.Linger != 3*time.Second || *cfg.Batch.Linger != 2*time.Second || cfg.Batch.Cycle != 15*time.Minute ||
+		m.DefaultEta != time.Minute || m.LoadTime != 30*time.Second || *m.SyncMaxWait != time.Minute || m.MaxWait != 0 || m.ResultTTL != cfg.Jobs.ResultTTL || m.Share != 1 {
 		t.Fatalf("defaults: jobs %+v model %+v", cfg.Jobs, m)
 	}
 	if _, err := config.Parse([]byte("models:\n  a:\n    cmd: x\n    maxBodySize: lots\n")); err == nil {
 		t.Fatal("bad size accepted")
 	}
-	if _, err := config.Parse([]byte("timeShare:\n  period: 1m\n  minSlice: 2m\nmodels:\n  a:\n    cmd: x\n")); err == nil {
-		t.Fatal("minSlice > period accepted")
+	old, err := config.Parse([]byte("timeShare:\n  period: 1m\n  minSlice: 2m\n  linger: 5s\nmodels:\n  a:\n    cmd: x\n"))
+	if err != nil || old.Batch.Cycle != time.Minute || *old.Batch.Linger != 5*time.Second || len(old.Warnings) != 3 {
+		t.Fatalf("v1 timeShare: %v %+v", err, old)
+	}
+}
+
+func TestJobPlaceEstimateAndBusy(t *testing.T) {
+	planned := jobModel + "\nloadTime: 1ms\ndefaultEta: 100ms"
+	st := newJobStack(t, "", "", map[string]fakeserver.Model{
+		"a": {Extra: planned},
+		"b": {Extra: planned + "\nmaxWait: 1s"},
+		"c": {Extra: planned},
+	})
+	first := st.submit(t, "a", "job?for=3s", `{}`)
+	for st.get(t, first.ID).Status != "running" {
+		time.Sleep(20 * time.Millisecond)
+	}
+	// a is loaded: validation runs and its eta_s becomes the job's cost.
+	long := st.submit(t, "a", "job?for=100ms", `{"eta": 20}`)
+	if v := st.get(t, long.ID); v.Batch == nil || *v.Batch != 1 || v.ETA == nil || *v.ETA < 19 {
+		t.Fatalf("a's second job: batch %v eta %v", v.Batch, v.ETA)
+	}
+
+	code, h, b := st.do(t, "POST", "/jobs/b/job", "application/json", `{}`)
+	var busy struct {
+		Detail   string `json:"detail"`
+		StartsIn int    `json:"starts_in_s"`
+	}
+	json.Unmarshal(b, &busy)
+	if code != 429 || busy.StartsIn < 19 || h.Get("Retry-After") == "" || !strings.Contains(busy.Detail, "busy") {
+		t.Fatalf("b past maxWait: %d %s (Retry-After %q)", code, b, h.Get("Retry-After"))
+	}
+
+	c := st.submit(t, "c", "job", `{}`)
+	v := st.get(t, c.ID)
+	if v.Batch == nil || *v.Batch != 2 || v.StartsIn == nil || *v.StartsIn < 19 {
+		t.Fatalf("c: batch %v starts in %v", v.Batch, v.StartsIn)
+	}
+
+	code, _, b = st.do(t, "GET", "/running", "", "")
+	var running struct {
+		Schedule router.Schedule `json:"schedule"`
+	}
+	json.Unmarshal(b, &running)
+	if code != 200 || len(running.Schedule.Batches) < 2 || running.Schedule.CycleS != 900 {
+		t.Fatalf("running: %d %s", code, b)
+	}
+	for _, id := range []string{first.ID, long.ID, c.ID} {
+		st.do(t, "DELETE", "/jobs/"+id, "", "")
 	}
 }

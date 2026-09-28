@@ -1,8 +1,9 @@
 # Time-share scheduling and jobs
 
-Status: **implemented** (scheduler in `internal/router`, jobs in
-`internal/jobs`, routes in `internal/server`). This document describes what is
-built; the workload side lives in `simple-ai-server/SYNC_SERVER_PLAN.md`.
+Status: **jobs implemented; the slice scheduler is replaced** by the batch
+scheduler of [time-share-v2-plan.md](time-share-v2-plan.md) (`timeShare` is
+still read: `period` becomes `batch.cycle`). The jobs part below is current;
+the workload side lives in `simple-ai-server/GUIDELINE.md`.
 
 ## Problem it solves
 

@@ -53,7 +53,6 @@ const (
 	validateTimeout = 10 * time.Second
 	progressTimeout = 2 * time.Second
 	sweepInterval   = time.Hour
-	historySize     = 10
 
 	// ErrRestarted is the error of a job that was running when the router
 	// stopped.
@@ -84,6 +83,7 @@ type Job struct {
 
 	cancel    context.CancelFunc
 	cancelled bool // DELETE was called
+	ticket    *router.Ticket
 	done      chan struct{}
 	doneOnce  sync.Once
 }
@@ -95,6 +95,8 @@ type View struct {
 	Path           string          `json:"path"`
 	Status         Status          `json:"status"`
 	Position       *int            `json:"position"`
+	Batch          *int            `json:"batch,omitempty"`
+	StartsIn       *int            `json:"starts_in_s,omitempty"`
 	ETA            *int            `json:"eta_s"`
 	Created        float64         `json:"created"`
 	Started        *float64        `json:"started"`
@@ -111,6 +113,8 @@ type View struct {
 type Error struct {
 	Status int
 	Detail string
+	// StartsIn is the predicted wait of a job refused as busy.
+	StartsIn *int
 }
 
 func (e *Error) Error() string { return e.Detail }
@@ -149,8 +153,7 @@ type Manager struct {
 
 	mu     sync.Mutex
 	jobs   map[string]*Job
-	order  []*Job               // oldest first
-	recent map[string][]float64 // durations of finished jobs, per model and path
+	order  []*Job // oldest first
 	closed bool
 
 	stop chan struct{}
@@ -167,7 +170,6 @@ func New(rt *router.Router) (*Manager, error) {
 		dir:    cfg.Jobs.Dir,
 		client: &http.Client{Transport: &http.Transport{DisableCompression: true}},
 		jobs:   make(map[string]*Job),
-		recent: make(map[string][]float64),
 		stop:   make(chan struct{}),
 	}
 	if err := m.load(); err != nil {
@@ -256,7 +258,8 @@ func (m *Manager) Submit(req Request) (*View, error) {
 	}
 	j.BodySize = size
 
-	if err := m.validate(mc, j); err != nil {
+	estimate, err := m.validate(mc, j)
+	if err != nil {
 		return nil, err
 	}
 
@@ -265,9 +268,14 @@ func (m *Manager) Submit(req Request) (*View, error) {
 	if m.closed {
 		return nil, errorf(http.StatusServiceUnavailable, "router is shutting down")
 	}
-	t, err := m.rt.Enqueue(mc.Name, router.KindJob)
+	t, err := m.rt.Enqueue(mc.Name, router.KindJob, router.Work{Path: j.Path, Estimate: estimate})
 	if err != nil {
+		var busy *router.BusyError
 		switch {
+		case errors.As(err, &busy):
+			e := errorf(http.StatusTooManyRequests, "%s", busy.Error())
+			e.StartsIn = seconds(busy.StartsIn.Seconds())
+			return nil, e
 		case errors.Is(err, router.ErrQueueFull):
 			return nil, errorf(http.StatusTooManyRequests, "queue full (%d waiting for %s)", mc.MaxQueue, mc.Name)
 		case errors.Is(err, router.ErrShutdown):
@@ -311,20 +319,21 @@ func storeBody(path string, body io.Reader, limit int64) (int64, error) {
 	return n, f.Close()
 }
 
-// validate asks a loaded model whether it accepts the request. It never
-// starts or swaps a model: when the model is not ready, or does not answer
-// in time, the job is queued unchecked.
-func (m *Manager) validate(mc *config.ModelConfig, j *Job) error {
+// validate asks a loaded model whether it accepts the request, and returns
+// the workload's own estimate of its run time (eta_s in the answer) when it
+// gives one. It never starts or swaps a model: when the model is not ready,
+// or does not answer in time, the job is queued unchecked.
+func (m *Manager) validate(mc *config.ModelConfig, j *Job) (time.Duration, error) {
 	if mc.Validate == nil {
-		return nil
+		return 0, nil
 	}
 	proxy, ready := m.rt.Ready(mc.Name)
 	if !ready {
-		return nil
+		return 0, nil
 	}
 	body, err := os.Open(filepath.Join(m.jobDir(j), routerDir, bodyName))
 	if err != nil {
-		return nil
+		return 0, nil
 	}
 	defer body.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), validateTimeout)
@@ -335,7 +344,7 @@ func (m *Manager) validate(mc *config.ModelConfig, j *Job) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
-		return nil
+		return 0, nil
 	}
 	req.ContentLength = j.BodySize
 	if j.ContentType != "" {
@@ -345,18 +354,24 @@ func (m *Manager) validate(mc *config.ModelConfig, j *Job) error {
 	resp, err := m.client.Do(req)
 	if err != nil {
 		slog.Warn("validation skipped", "model", mc.Name, "err", err)
-		return nil
+		return 0, nil
 	}
 	defer resp.Body.Close()
 	reply, err := io.ReadAll(io.LimitReader(resp.Body, maxReplySize))
 	if err != nil {
 		slog.Warn("validation skipped", "model", mc.Name, "err", err)
-		return nil
+		return 0, nil
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
+		var a struct {
+			ETA float64 `json:"eta_s"`
+		}
+		if json.Unmarshal(reply, &a) == nil && a.ETA > 0 && !math.IsInf(a.ETA, 0) {
+			return time.Duration(a.ETA * float64(time.Second)), nil
+		}
+		return 0, nil
 	}
-	return &UpstreamReply{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: reply}
+	return 0, &UpstreamReply{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: reply}
 }
 
 // save writes the job's record atomically. Callers hold m.mu or own the job.
@@ -396,6 +411,7 @@ func (m *Manager) saveLogged(j *Job) {
 func (m *Manager) startLocked(j *Job, t *router.Ticket) {
 	ctx, cancel := context.WithCancel(context.Background())
 	j.cancel = cancel
+	j.ticket = t
 	m.jobs[j.ID] = j
 	m.order = append(m.order, j)
 	m.wg.Go(func() {
@@ -412,6 +428,14 @@ func (m *Manager) run(ctx context.Context, j *Job, t *router.Ticket) {
 		return
 	}
 	defer release()
+	defer func() {
+		m.mu.Lock()
+		failed := j.Status != Done
+		m.mu.Unlock()
+		if failed {
+			t.NoSample() // a failed run says nothing about the next one
+		}
+	}()
 
 	m.mu.Lock()
 	if m.closed || j.Status.Terminal() {
@@ -662,13 +686,6 @@ func (m *Manager) finish(j *Job, status Status, set func()) {
 		}
 	}
 	final := j.Status
-	if final == Done && j.Started > 0 {
-		key := historyKey(j.Model, j.Path)
-		m.recent[key] = append(m.recent[key], j.Finished-j.Started)
-		if n := len(m.recent[key]); n > historySize {
-			m.recent[key] = m.recent[key][n-historySize:]
-		}
-	}
 	m.cleanFiles(j)
 	m.saveLogged(j)
 	m.mu.Unlock()
@@ -696,8 +713,6 @@ func (m *Manager) cleanFiles(j *Job) {
 		}
 	}
 }
-
-func historyKey(model, path string) string { return model + "\x00" + path }
 
 // Cancel cancels a queued or running job.
 func (m *Manager) Cancel(id string) (*View, error) {
@@ -836,23 +851,21 @@ func (m *Manager) viewLocked(j *Job) *View {
 	switch j.Status {
 	case Queued:
 		pos := 0
-		eta, known := 0.0, true
 		for _, o := range m.order {
-			if o.Model != j.Model || o.Status.Terminal() {
-				continue
-			}
 			if o == j {
 				break
 			}
-			if o.Status == Queued {
+			if o.Model == j.Model && o.Status == Queued {
 				pos++
 			}
-			left, ok := m.remainingLocked(o)
-			eta, known = eta+left, known && ok
 		}
 		v.Position = &pos
-		if own, ok := m.remainingLocked(j); ok && known {
-			v.ETA = seconds(eta + own)
+		if j.ticket != nil {
+			if p, ok := j.ticket.Place(); ok {
+				v.Batch = &p.Batch
+				v.StartsIn = seconds(p.StartsIn.Seconds())
+				v.ETA = seconds((p.StartsIn + p.Cost).Seconds())
+			}
 		}
 	case Running:
 		if left, ok := m.remainingLocked(j); ok {
@@ -867,28 +880,18 @@ func seconds(s float64) *int {
 	return &n
 }
 
-// remainingLocked estimates the run time a job still needs: from the
-// workload's own eta_s while it runs, otherwise from the recent jobs with the
-// same model and path.
+// remainingLocked estimates the run time a running job still needs: the
+// workload's own eta_s from progress, else the average of the recent runs of
+// the same model and path, minus the time elapsed.
 func (m *Manager) remainingLocked(j *Job) (float64, bool) {
-	if j.Status == Running {
-		if eta, ok := j.Progress["eta_s"].(float64); ok && eta >= 0 {
-			return eta, true
-		}
+	if eta, ok := j.Progress["eta_s"].(float64); ok && eta >= 0 {
+		return eta, true
 	}
-	recent := m.recent[historyKey(j.Model, j.Path)]
-	if len(recent) == 0 {
+	avg, ok := m.rt.Average(j.Model, j.Path)
+	if !ok {
 		return 0, false
 	}
-	avg := 0.0
-	for _, d := range recent {
-		avg += d
-	}
-	avg /= float64(len(recent))
-	if j.Status == Running {
-		return max(1, avg-(now()-j.Started)), true
-	}
-	return avg, true
+	return max(1, avg.Seconds()-(now()-j.Started)), true
 }
 
 // load reads the jobs of every configured model from disk.
@@ -933,7 +936,7 @@ func (m *Manager) load() error {
 				j.Status, j.Finished, j.Error = Failed, now(), "stored request is missing"
 				break
 			}
-			t, err := m.rt.Requeue(j.Model, router.KindJob)
+			t, err := m.rt.Requeue(j.Model, router.KindJob, router.Work{Path: j.Path})
 			if err != nil {
 				j.Status, j.Finished, j.Error = Failed, now(), err.Error()
 				break
@@ -943,11 +946,7 @@ func (m *Manager) load() error {
 			continue
 		case Done:
 			if j.Started > 0 && j.Finished > 0 {
-				key := historyKey(j.Model, j.Path)
-				m.recent[key] = append(m.recent[key], j.Finished-j.Started)
-				if n := len(m.recent[key]); n > historySize {
-					m.recent[key] = m.recent[key][n-historySize:]
-				}
+				m.rt.Seed(j.Model, j.Path, time.Duration((j.Finished-j.Started)*float64(time.Second)))
 			}
 		}
 		if j.Status != Done {

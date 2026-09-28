@@ -33,6 +33,11 @@ func Config(t testing.TB, globals string, models map[string]Model) *config.Confi
 	}
 	sort.Strings(names)
 
+	if !strings.Contains(globals, "jobs:") {
+		// Keep the jobs folder, and what the router learns, out of the
+		// package directory.
+		globals += fmt.Sprintf("\njobs: {dir: %q}\n", t.TempDir())
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "startPort: %d\nhealthCheckTimeout: 5s\n%s\nmodels:\n", freePortRange(t, len(models)), globals)
 	for _, n := range names {

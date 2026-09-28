@@ -50,6 +50,9 @@ func run(configPath, listen string) error {
 	if listen != "" {
 		cfg.Listen = listen
 	}
+	for _, w := range cfg.Warnings {
+		slog.Warn("config: " + w)
+	}
 
 	rt := router.New(cfg, os.Stderr)
 	jm, err := jobs.New(rt)

@@ -25,9 +25,11 @@ const (
 	defaultCheckEndpoint      = "/health"
 	defaultBusyInterval       = 2 * time.Second
 	defaultBusyGrace          = 15 * time.Second
-	defaultPeriod             = 10 * time.Minute
-	defaultMinSlice           = time.Minute
+	defaultCycle              = 15 * time.Minute
 	defaultLinger             = 2 * time.Second
+	defaultDefaultEta         = time.Minute
+	defaultLoadTime           = 30 * time.Second
+	defaultSyncMaxWait        = time.Minute
 	defaultJobsDir            = "jobs"
 	defaultResultTTL          = 30 * 24 * time.Hour
 	defaultMaxBodySize        = 64 << 20
@@ -40,25 +42,37 @@ type Config struct {
 	HealthCheckTimeout time.Duration `yaml:"healthCheckTimeout"`
 	// DrainTimeout bounds how long a swap waits for in-flight requests on
 	// the outgoing model before killing it anyway.
-	DrainTimeout time.Duration           `yaml:"drainTimeout"`
-	TimeShare    TimeShare               `yaml:"timeShare"`
-	Jobs         Jobs                    `yaml:"jobs"`
-	Models       map[string]*ModelConfig `yaml:"models"`
+	DrainTimeout time.Duration `yaml:"drainTimeout"`
+	Batch        Batch         `yaml:"batch"`
+	// TimeShare is the v1 section, still read: period becomes batch.cycle
+	// and linger batch.linger.
+	TimeShare TimeShare               `yaml:"timeShare"`
+	Jobs      Jobs                    `yaml:"jobs"`
+	Models    map[string]*ModelConfig `yaml:"models"`
+
+	// Warnings are problems that do not stop the router, such as deprecated
+	// fields. Filled in by Load.
+	Warnings []string `yaml:"-"`
 
 	// aliases maps an alias to its real model name. Built by Load.
 	aliases map[string]string
 }
 
-// TimeShare sizes the slice a model gets when several models have work.
-type TimeShare struct {
-	// Period is one full rotation when every model has work.
-	Period time.Duration `yaml:"period"`
-	// MinSlice is the shortest slice a loaded model gets while it has work.
-	MinSlice time.Duration `yaml:"minSlice"`
-	// Linger is how long an idle active model waits for more work before it
-	// yields to a waiting model. Nil means the default; a pointer so that
-	// an explicit 0s is not mistaken for unset.
+// Batch configures the batch scheduler (docs/time-share-v2-plan.md).
+type Batch struct {
+	// Cycle is the target length of one batch.
+	Cycle time.Duration `yaml:"cycle"`
+	// Linger is how long an idle model whose turn it is waits for more work
+	// before its turn ends. Nil means the default; a pointer so that an
+	// explicit 0s is not mistaken for unset.
 	Linger *time.Duration `yaml:"linger"`
+}
+
+// TimeShare is the deprecated v1 section.
+type TimeShare struct {
+	Period   time.Duration  `yaml:"period"`
+	MinSlice time.Duration  `yaml:"minSlice"`
+	Linger   *time.Duration `yaml:"linger"`
 }
 
 // Jobs configures the router's job store.
@@ -133,7 +147,8 @@ type ModelConfig struct {
 	// models' ports do not shift.
 	Disabled bool `yaml:"disabled"`
 
-	// Share weighs this model's slice against the others (default 1).
+	// Share weighs this model's part of a batch against the others
+	// (default 1).
 	Share int `yaml:"share"`
 	// Concurrency caps the requests admitted at the same time (0 = no cap).
 	// Jobs run one at a time unless it is above 1.
@@ -149,10 +164,22 @@ type ModelConfig struct {
 	ResultTTL   time.Duration `yaml:"resultTTL"`
 	KeepJobs    int           `yaml:"keepJobs"`
 	MaxBodySize ByteSize      `yaml:"maxBodySize"`
-	// Linger overrides timeShare.linger.
-	Linger   *time.Duration `yaml:"linger"`
-	Progress *Progress      `yaml:"progress"`
-	Validate *Endpoint      `yaml:"validate"`
+	// Linger overrides batch.linger.
+	Linger *time.Duration `yaml:"linger"`
+	// DefaultEta is the cost of a request before anything is learned about
+	// its path (default 1m).
+	DefaultEta time.Duration `yaml:"defaultEta"`
+	// LoadTime is the first guess of the model's load time, until one is
+	// measured (default 30s).
+	LoadTime time.Duration `yaml:"loadTime"`
+	// SyncMaxWait: a request that stays open (/v1/...) and would wait longer
+	// than this for its turn is answered 503 at once (default 1m; 0 = wait).
+	SyncMaxWait *time.Duration `yaml:"syncMaxWait"`
+	// MaxWait: a job whose predicted start is later is refused with 429
+	// (0 = no limit).
+	MaxWait  time.Duration `yaml:"maxWait"`
+	Progress *Progress     `yaml:"progress"`
+	Validate *Endpoint     `yaml:"validate"`
 
 	// Filled in by Load.
 	Name string   `yaml:"-"`
@@ -261,22 +288,31 @@ func (c *Config) finalize(baseDir string) error {
 	if len(c.Models) == 0 {
 		return fmt.Errorf("config: no models defined")
 	}
-	ts := &c.TimeShare
-	if ts.Period == 0 {
-		ts.Period = defaultPeriod
+	b, ts := &c.Batch, &c.TimeShare
+	if ts.Period != 0 {
+		c.Warnings = append(c.Warnings, "timeShare.period is deprecated; use batch.cycle")
+		if b.Cycle == 0 {
+			b.Cycle = ts.Period
+		}
 	}
-	if ts.MinSlice == 0 {
-		ts.MinSlice = min(defaultMinSlice, ts.Period)
+	if ts.MinSlice != 0 {
+		c.Warnings = append(c.Warnings, "timeShare.minSlice is deprecated and ignored")
 	}
-	if ts.Linger == nil {
+	if ts.Linger != nil {
+		c.Warnings = append(c.Warnings, "timeShare.linger is deprecated; use batch.linger")
+		if b.Linger == nil {
+			b.Linger = ts.Linger
+		}
+	}
+	if b.Cycle == 0 {
+		b.Cycle = defaultCycle
+	}
+	if b.Linger == nil {
 		d := defaultLinger
-		ts.Linger = &d
+		b.Linger = &d
 	}
-	if ts.Period < 0 || ts.MinSlice < 0 || *ts.Linger < 0 {
-		return fmt.Errorf("config: timeShare durations must not be negative")
-	}
-	if ts.MinSlice > ts.Period {
-		return fmt.Errorf("config: timeShare.minSlice (%s) is longer than period (%s)", ts.MinSlice, ts.Period)
+	if b.Cycle < 0 || *b.Linger < 0 {
+		return fmt.Errorf("config: batch durations must not be negative")
 	}
 	if c.Jobs.Dir == "" {
 		c.Jobs.Dir = defaultJobsDir
@@ -351,9 +387,22 @@ func (c *Config) finalize(baseDir string) error {
 			m.MaxBodySize = c.Jobs.MaxBodySize
 		}
 		if m.Linger == nil {
-			m.Linger = ts.Linger
+			m.Linger = b.Linger
 		} else if *m.Linger < 0 {
 			return fmt.Errorf("model %q: linger must not be negative", name)
+		}
+		if m.DefaultEta == 0 {
+			m.DefaultEta = defaultDefaultEta
+		}
+		if m.LoadTime == 0 {
+			m.LoadTime = defaultLoadTime
+		}
+		if m.SyncMaxWait == nil {
+			d := defaultSyncMaxWait
+			m.SyncMaxWait = &d
+		}
+		if m.DefaultEta < 0 || m.LoadTime < 0 || *m.SyncMaxWait < 0 || m.MaxWait < 0 {
+			return fmt.Errorf("model %q: defaultEta, loadTime, syncMaxWait and maxWait must not be negative", name)
 		}
 		if p := m.Progress; p != nil {
 			if !strings.HasPrefix(p.Endpoint, "/") {

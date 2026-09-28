@@ -1,7 +1,7 @@
 # Time-share v2: batch scheduling, pipelines and an artifact cache
 
-Status: **plan**. Builds on [time-share-plan.md](time-share-plan.md) (queue, slices, jobs; implemented,
-tests green, not yet committed). The workload side is fixed by `simple-ai-server/GUIDELINE.md`:
+Status: **part A implemented** (phases 0-2: `internal/router/batch.go`, `stats.go`); parts B and
+C are next. Builds on [time-share-plan.md](time-share-plan.md) (jobs). The workload side is fixed by `simple-ai-server/GUIDELINE.md`:
 synchronous workers, one file per call, no queue, no stored results, and *"a later call that needs an
 earlier output gets it in its request"*. That moves two jobs onto the router: the **job queue** (done)
 and the **artifacts** that flow between calls (part B).
@@ -34,7 +34,9 @@ batch ≤ number of models in it.
 
 If the GPU would otherwise sit idle (running batch done, loaded model has nothing), the next batch
 starts at once: no waiting window. With only one model having work, nothing changes from today: it
-never yields and stays until `ttl`.
+never yields and stays until `ttl`. When another model starts to wait for a model that was alone, the
+running batch starts over from that moment: the alone model keeps one cycle of its waiting work in
+it, and the rest moves to the next batch.
 
 ### A2. Order within a batch
 
@@ -155,7 +157,8 @@ replayed with learned ETAs and load times; recomputed on demand, cheap):
 own run time. Both are estimates, not promises (A3).
 
 **Jobs are never refused for being out of the batch**; they queue and report `starts_in_s`. Busy
-answers only in two cases:
+answers only in the two cases below, and only on a wait the router is sure of: guessed costs
+(`defaultEta`) and load times never measured count as nothing, and a model's own load is not a wait.
 
 - **Sync requests** (`/v1/...`): served at once by joining the running batch or without contention; otherwise they wait if the predicted start
   is under `syncMaxWait` (per model, default `60s`), else `503` at once with `Retry-After` and
@@ -270,8 +273,9 @@ models:
     share: 1
 ```
 
-`timeShare.period`, `minSlice` and `linger` are removed; a config that still has them loads with a
-warning and `period` is used as `cycle`.
+`timeShare` is deprecated: a config that still has it loads with a warning, `period` becomes
+`batch.cycle`, `linger` becomes `batch.linger` (how long an idle model waits for more work before its
+turn ends, default `2s`), and `minSlice` is ignored.
 
 ## Risks
 

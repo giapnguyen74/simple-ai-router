@@ -6,11 +6,12 @@ startPort: 10001
 healthCheckTimeout: 120s
 # How long a swap waits for in-flight requests on the outgoing model.
 drainTimeout: 5m
-# Time-share between models that have work at the same time (defaults shown).
-timeShare:
-  period: 10m     # one full rotation when every model has work
-  minSlice: 1m    # a loaded model keeps the GPU at least this long while it has work
-  linger: 2s      # an idle model waits this long for more work before yielding
+# Batch scheduler for models that have work at the same time (defaults shown).
+# Work is booked into batches of about one cycle; each model runs its part of a
+# batch in one turn, so it is loaded at most once per batch.
+batch:
+  cycle: 15m      # target length of one batch
+  linger: 2s      # an idle model waits this long for more work before its turn ends
 # The router's job store (defaults shown). One folder per job: <dir>/<model>/<id>/.
 jobs:
   dir: ./jobs             # relative to this file
@@ -25,7 +26,11 @@ models:
         --port ${PORT} -ngl 99 -c 8192
     aliases: [gpt-4o-mini]
     ttl: 10m               # unload after 10 minutes idle (0 = never)
-    share: 3               # three quarters of the period against a share-1 model
+    share: 3               # three quarters of a batch against a share-1 model
+    # defaultEta: 1m       # cost of a request before its path's duration is learned
+    # loadTime: 30s        # first guess of the load time, until one is measured
+    # syncMaxWait: 1m      # a /v1 request that would wait longer gets 503 at once (0 = wait)
+    # maxWait: 0           # a job predicted to start later gets 429 (0 = no limit)
     # concurrency: 0       # requests admitted at once (0 = no cap)
     # maxQueue: 0          # waiting requests before 429 (0 = no cap)
     # queueTimeout: 0      # give up waiting with 503 (0 = never)

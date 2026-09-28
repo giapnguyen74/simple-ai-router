@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -115,9 +116,13 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) proxy(w http.ResponseWriter, r *http.Request, model string) {
 	start := time.Now()
-	p, release, err := s.router.Acquire(r.Context(), model)
+	p, release, err := s.router.AcquirePath(r.Context(), model, strings.TrimPrefix(r.URL.Path, "/"))
 	if err != nil {
+		var busy *router.BusyError
 		switch {
+		case errors.As(err, &busy):
+			w.Header().Set("Retry-After", retryAfter(busy.StartsIn))
+			writeError(w, http.StatusServiceUnavailable, busy.Error())
 		case errors.Is(err, router.ErrUnknownModel):
 			writeError(w, http.StatusNotFound, "model not found: "+model)
 		case errors.Is(err, router.ErrQueueFull):
@@ -200,7 +205,7 @@ func (s *Server) handleRunning(w http.ResponseWriter, _ *http.Request) {
 			infos[i].Jobs = counts[infos[i].Name]
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": infos})
+	writeJSON(w, http.StatusOK, map[string]any{"models": infos, "schedule": s.router.Schedule()})
 }
 
 func (s *Server) handleJobSubmit(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +323,11 @@ func writeJobError(w http.ResponseWriter, err error) {
 	}
 	var je *jobs.Error
 	if errors.As(err, &je) {
+		if je.StartsIn != nil {
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, *je.StartsIn)))
+			writeJSON(w, je.Status, map[string]any{"detail": je.Detail, "starts_in_s": *je.StartsIn})
+			return
+		}
 		if je.Status == http.StatusTooManyRequests || je.Status == http.StatusServiceUnavailable {
 			w.Header().Set("Retry-After", "10")
 		}
@@ -325,6 +335,11 @@ func writeJobError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeDetail(w, http.StatusInternalServerError, err.Error())
+}
+
+// retryAfter is a Retry-After value in whole seconds, at least 1.
+func retryAfter(d time.Duration) string {
+	return strconv.Itoa(max(1, int(math.Ceil(d.Seconds()))))
 }
 
 func writeDetail(w http.ResponseWriter, status int, detail string) {
