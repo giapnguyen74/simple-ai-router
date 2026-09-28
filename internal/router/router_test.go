@@ -337,7 +337,7 @@ func TestTTLKeepsBusyModel(t *testing.T) {
 
 // --- batch scheduler ---
 
-const fastShare = "batch:\n  cycle: 600ms\n  linger: 50ms\n"
+const fastShare = "batch:\n  minCycle: 600ms\n  maxCycle: 600ms\n  linger: 50ms\n"
 
 // pump keeps one request after another going to a model until stop is
 // closed, and counts them.
@@ -395,7 +395,7 @@ func TestModelsWithWorkTakeTurns(t *testing.T) {
 }
 
 func TestSharesSplitABatch(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 3s\n", map[string]fakeserver.Model{
+	r := newRouter(t, "batch:\n  minCycle: 3s\n  maxCycle: 3s\n", map[string]fakeserver.Model{
 		"a": {Extra: planned + "\nshare: 2"}, "b": {Extra: planned}, "c": {Extra: planned},
 	})
 	_, release := acquire(t, r, "c")
@@ -459,7 +459,7 @@ func TestLoadedModelGoesFirstInTheNextBatch(t *testing.T) {
 func TestIdleModelYieldsAtOnceOrAfterLinger(t *testing.T) {
 	for _, linger := range []time.Duration{0, 700 * time.Millisecond} {
 		// A long period, so the slice does not end before linger does.
-		r := newRouter(t, "batch:\n  cycle: 10s\n", map[string]fakeserver.Model{
+		r := newRouter(t, "batch:\n  minCycle: 10s\n  maxCycle: 10s\n", map[string]fakeserver.Model{
 			"a": {Extra: "linger: " + linger.String()},
 			"b": {},
 		})
@@ -669,7 +669,7 @@ func batchOf(t *testing.T, tk *Ticket) int {
 }
 
 func TestNewcomerTakesItsPartAndFloodMovesBack(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 1s\n", map[string]fakeserver.Model{
+	r := newRouter(t, "batch:\n  minCycle: 1s\n  maxCycle: 1s\n", map[string]fakeserver.Model{
 		"a": {Extra: planned}, "b": {Extra: planned}, "c": {Extra: planned},
 	})
 	_, release := acquire(t, r, "a")
@@ -707,7 +707,7 @@ func TestNewcomerTakesItsPartAndFloodMovesBack(t *testing.T) {
 }
 
 func TestJoinUsesOnlyUnbookedTime(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 1s\n", map[string]fakeserver.Model{
+	r := newRouter(t, "batch:\n  minCycle: 1s\n  maxCycle: 1s\n", map[string]fakeserver.Model{
 		"a": {Extra: planned}, "b": {Extra: planned},
 	})
 	_, release := acquire(t, r, "a")
@@ -729,7 +729,7 @@ func TestJoinUsesOnlyUnbookedTime(t *testing.T) {
 }
 
 func TestTicketLongerThanItsPartBooksAlone(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 1s\n", map[string]fakeserver.Model{
+	r := newRouter(t, "batch:\n  minCycle: 1s\n  maxCycle: 1s\n", map[string]fakeserver.Model{
 		"a": {Extra: planned}, "b": {Extra: planned},
 	})
 	_, release := acquire(t, r, "a")
@@ -742,7 +742,7 @@ func TestTicketLongerThanItsPartBooksAlone(t *testing.T) {
 }
 
 func TestSyncRequestIsBusyPastSyncMaxWait(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 1s\n", map[string]fakeserver.Model{
+	r := newRouter(t, "batch:\n  minCycle: 1s\n  maxCycle: 1s\n", map[string]fakeserver.Model{
 		"a": {Extra: planned}, "b": {Extra: planned + "\nsyncMaxWait: 200ms\nmaxWait: 200ms"},
 	})
 	_, release := acquire(t, r, "a")
@@ -785,7 +785,7 @@ func TestLearnsDurationsAndLoadTime(t *testing.T) {
 }
 
 func TestDependentsBookAfterWhatTheyWaitFor(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 1s\n", map[string]fakeserver.Model{
+	r := newRouter(t, "batch:\n  minCycle: 1s\n  maxCycle: 1s\n", map[string]fakeserver.Model{
 		"a": {Extra: planned}, "b": {Extra: planned}, "c": {Extra: planned},
 	})
 	_, release := acquire(t, r, "a")
@@ -819,7 +819,7 @@ func TestDependentsBookAfterWhatTheyWaitFor(t *testing.T) {
 }
 
 func TestIdleLoadedModelLingersWhenContentionStarts(t *testing.T) {
-	r := newRouter(t, "batch:\n  cycle: 10s\n  linger: 400ms\n", map[string]fakeserver.Model{"a": {}, "b": {}})
+	r := newRouter(t, "batch:\n  minCycle: 10s\n  maxCycle: 10s\n  linger: 400ms\n", map[string]fakeserver.Model{"a": {}, "b": {}})
 	p, release := acquire(t, r, "a")
 	pid := p.Info().PID
 	release()
@@ -844,5 +844,61 @@ func TestIdleLoadedModelLingersWhenContentionStarts(t *testing.T) {
 	wg.Wait()
 	if len(order) != 2 || order[0] != "a" {
 		t.Fatalf("order %v: a was loaded and its request came within linger", order)
+	}
+}
+
+func cycleOf(t *testing.T, r *Router, batch int) float64 {
+	t.Helper()
+	for _, b := range r.Schedule().Batches {
+		if b.Batch == batch {
+			return b.CycleS
+		}
+	}
+	t.Fatalf("no batch %d in %+v", batch, r.Schedule().Batches)
+	return 0
+}
+
+func TestCycleAdaptsToLoadsAndLongestJob(t *testing.T) {
+	const models = "loadTime: 200ms\ndefaultEta: 100ms"
+	r := newRouter(t, "batch:\n  minCycle: 500ms\n  maxCycle: 10s\n  maxSwitchOverhead: 0.1\n", map[string]fakeserver.Model{
+		"a": {Extra: models}, "b": {Extra: models}, "c": {Extra: models},
+	})
+	_, release := acquire(t, r, "a")
+	defer release()
+
+	enqueueJob(t, r, "b", 100*time.Millisecond)
+	if c := cycleOf(t, r, 2); c != 2 {
+		t.Fatalf("one load of 200ms at 10%% overhead: cycle %.2fs, want 2s", c)
+	}
+	enqueueJob(t, r, "c", 100*time.Millisecond)
+	if c := cycleOf(t, r, 2); c != 4 {
+		t.Fatalf("two loads: cycle %.2fs, want 4s", c)
+	}
+	enqueueJob(t, r, "c", 6*time.Second) // books a later batch, alone for c
+	long := 0.0
+	for _, b := range r.Schedule().Batches {
+		long = max(long, b.CycleS)
+	}
+	if long < 6 || long > 10 {
+		t.Fatalf("a batch with a 6s job: longest cycle %.2fs, want it to fit the job", long)
+	}
+	enqueueJob(t, r, "b", 30*time.Second)
+	for _, b := range r.Schedule().Batches {
+		if b.CycleS > 10 {
+			t.Fatalf("cycle %.2fs over maxCycle", b.CycleS)
+		}
+	}
+}
+
+func TestCycleOfAModelAloneIsMinCycle(t *testing.T) {
+	r := newRouter(t, "batch:\n  minCycle: 700ms\n  maxCycle: 10s\n", map[string]fakeserver.Model{
+		"a": {Extra: planned}, "b": {Extra: planned},
+	})
+	_, release := acquire(t, r, "a")
+	defer release()
+	enqueueJob(t, r, "b", 100*time.Millisecond)
+	s := r.Schedule()
+	if s.CycleS != 0.7 || s.MaxCycleS != 10 {
+		t.Fatalf("running batch of a loaded model alone: cycle %.2fs (max %.0fs), want minCycle", s.CycleS, s.MaxCycleS)
 	}
 }

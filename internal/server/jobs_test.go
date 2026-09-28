@@ -561,7 +561,7 @@ func TestJobsConfigDefaults(t *testing.T) {
 	}
 	m := cfg.Models["a"]
 	if cfg.Jobs.ResultTTL != 30*24*time.Hour || cfg.Jobs.MaxBodySize != 64<<20 || !filepath.IsAbs(cfg.Jobs.Dir) ||
-		m.MaxBodySize != 2<<20 || *m.Linger != 3*time.Second || *cfg.Batch.Linger != 2*time.Second || cfg.Batch.Cycle != 15*time.Minute ||
+		m.MaxBodySize != 2<<20 || *m.Linger != 3*time.Second || *cfg.Batch.Linger != 2*time.Second || cfg.Batch.MinCycle != 2*time.Minute || cfg.Batch.MaxCycle != 30*time.Minute || cfg.Batch.MaxSwitchOverhead != 0.1 ||
 		m.DefaultEta != time.Minute || m.LoadTime != 30*time.Second || *m.SyncMaxWait != time.Minute || m.MaxWait != 0 || m.ResultTTL != cfg.Jobs.ResultTTL || m.Share != 1 {
 		t.Fatalf("defaults: jobs %+v model %+v", cfg.Jobs, m)
 	}
@@ -569,7 +569,7 @@ func TestJobsConfigDefaults(t *testing.T) {
 		t.Fatal("bad size accepted")
 	}
 	old, err := config.Parse([]byte("timeShare:\n  period: 1m\n  minSlice: 2m\n  linger: 5s\nmodels:\n  a:\n    cmd: x\n"))
-	if err != nil || old.Batch.Cycle != time.Minute || *old.Batch.Linger != 5*time.Second || len(old.Warnings) != 3 {
+	if err != nil || old.Batch.MaxCycle != time.Minute || old.Batch.MinCycle != time.Minute || *old.Batch.Linger != 5*time.Second || len(old.Warnings) != 3 {
 		t.Fatalf("v1 timeShare: %v %+v", err, old)
 	}
 }
@@ -612,7 +612,7 @@ func TestJobPlaceEstimateAndBusy(t *testing.T) {
 		Schedule router.Schedule `json:"schedule"`
 	}
 	json.Unmarshal(b, &running)
-	if code != 200 || len(running.Schedule.Batches) < 2 || running.Schedule.CycleS != 900 {
+	if code != 200 || len(running.Schedule.Batches) < 2 || running.Schedule.MaxCycleS != 1800 {
 		t.Fatalf("running: %d %s", code, b)
 	}
 	for _, id := range []string{first.ID, long.ID, c.ID} {

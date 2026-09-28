@@ -25,7 +25,9 @@ const (
 	defaultCheckEndpoint      = "/health"
 	defaultBusyInterval       = 2 * time.Second
 	defaultBusyGrace          = 15 * time.Second
-	defaultCycle              = 15 * time.Minute
+	defaultMinCycle           = 2 * time.Minute
+	defaultMaxCycle           = 30 * time.Minute
+	defaultMaxSwitchOverhead  = 0.1
 	defaultLinger             = 2 * time.Second
 	defaultDefaultEta         = time.Minute
 	defaultLoadTime           = 30 * time.Second
@@ -62,9 +64,16 @@ type Config struct {
 	aliases map[string]string
 }
 
-// Batch configures the batch scheduler (docs/time-share-v2-plan.md).
+// Batch configures the batch scheduler (docs/time-share-v2-plan.md). The
+// length of each batch adapts: long enough that loading its models costs at
+// most MaxSwitchOverhead of it and that its longest job fits, within
+// MinCycle and MaxCycle.
 type Batch struct {
-	// Cycle is the target length of one batch.
+	MinCycle time.Duration `yaml:"minCycle"`
+	MaxCycle time.Duration `yaml:"maxCycle"`
+	// MaxSwitchOverhead is the share of a batch its model loads may take.
+	MaxSwitchOverhead float64 `yaml:"maxSwitchOverhead"`
+	// Cycle is deprecated: read as maxCycle.
 	Cycle time.Duration `yaml:"cycle"`
 	// Linger is how long an idle model whose turn it is waits for more work
 	// before its turn ends. Nil means the default; a pointer so that an
@@ -309,9 +318,15 @@ func (c *Config) finalize(baseDir string) error {
 	}
 	b, ts := &c.Batch, &c.TimeShare
 	if ts.Period != 0 {
-		c.Warnings = append(c.Warnings, "timeShare.period is deprecated; use batch.cycle")
-		if b.Cycle == 0 {
-			b.Cycle = ts.Period
+		c.Warnings = append(c.Warnings, "timeShare.period is deprecated; read as batch.maxCycle")
+		if b.MaxCycle == 0 && b.Cycle == 0 {
+			b.MaxCycle = ts.Period
+		}
+	}
+	if b.Cycle != 0 {
+		c.Warnings = append(c.Warnings, "batch.cycle is deprecated (batches adapt); read as batch.maxCycle")
+		if b.MaxCycle == 0 {
+			b.MaxCycle = b.Cycle
 		}
 	}
 	if ts.MinSlice != 0 {
@@ -323,15 +338,27 @@ func (c *Config) finalize(baseDir string) error {
 			b.Linger = ts.Linger
 		}
 	}
-	if b.Cycle == 0 {
-		b.Cycle = defaultCycle
+	if b.MaxCycle == 0 {
+		b.MaxCycle = defaultMaxCycle
+	}
+	if b.MinCycle == 0 {
+		b.MinCycle = min(defaultMinCycle, b.MaxCycle)
+	}
+	if b.MaxSwitchOverhead == 0 {
+		b.MaxSwitchOverhead = defaultMaxSwitchOverhead
 	}
 	if b.Linger == nil {
 		d := defaultLinger
 		b.Linger = &d
 	}
-	if b.Cycle < 0 || *b.Linger < 0 {
+	if b.MinCycle < 0 || b.MaxCycle < 0 || *b.Linger < 0 {
 		return fmt.Errorf("config: batch durations must not be negative")
+	}
+	if b.MinCycle > b.MaxCycle {
+		return fmt.Errorf("config: batch.minCycle (%s) is longer than maxCycle (%s)", b.MinCycle, b.MaxCycle)
+	}
+	if b.MaxSwitchOverhead <= 0 || b.MaxSwitchOverhead >= 1 {
+		return fmt.Errorf("config: batch.maxSwitchOverhead must be between 0 and 1")
 	}
 	if c.Jobs.Dir == "" {
 		c.Jobs.Dir = defaultJobsDir

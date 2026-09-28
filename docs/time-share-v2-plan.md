@@ -47,13 +47,21 @@ it, and the rest moves to the next batch.
 
 ### A3. Booking to the cycle
 
-`batch.cycle` (e.g. `15m`) is the target length of one batch. A batch is shared only among the models
-that have tickets booked in it; nothing is reserved for models that are not there:
+A batch's **cycle adapts** to what is booked in it (it was a fixed `batch.cycle` at first):
 
 ```
-budget(k) = cycle − Σ loadTime(models in batch k that need a switch)
+loads(k) = load times of the models in batch k that need a switch
+cycle(k) = clamp( max(loads(k) / maxSwitchOverhead, longest job in k + loads(k)), minCycle, maxCycle )
+budget(k) = cycle(k) − loads(k)
 quota(m, k) = budget(k) × share(m) / Σ share(models booked in batch k)     max-min fair
 ```
+
+The model loaded when a batch starts costs no load: the active model for the running and the next
+batch; for later ones the guess is that it is the slowest-loading one. So more models in a batch make
+it longer (their loads are amortized), a batch of one model after another is `minCycle`, and a batch
+holding a long render stretches to fit it, never past `maxCycle`. Load times are learned (A5), so the
+cycles follow them. Defaults: `minCycle: 2m`, `maxCycle: 30m`, `maxSwitchOverhead: 0.1`; `batch.cycle`
+and `timeShare.period` are still read, as `maxCycle`.
 
 Max-min fair: a model that needs less than its share keeps only what it needs, and the rest goes to the
 others. A model alone in a batch has the whole cycle.
@@ -171,7 +179,7 @@ and the booked batches (tickets and booked time per model, expected start).
 
 ### Example
 
-`cycle: 15m`, equal shares. Batch 1 runs A. A has booked 40 min of work: all 15 min of batch 2, then
+A batch of 15 min (say `maxCycle: 15m` and long loads), equal shares. Batch 1 runs A. A has booked 40 min of work: all 15 min of batch 2, then
 batches 3 and 4. One B request (3 min) arrives.
 
 ```
@@ -256,7 +264,9 @@ hash) as a `done` job returns that job at once, without a ticket. Only for reque
 
 ```yaml
 batch:
-  cycle: 15m          # target batch length
+  minCycle: 2m
+  maxCycle: 30m       # bounds how long other models wait
+  maxSwitchOverhead: 0.1
 jobs:
   dir: ./jobs
   resultTTL: 720h
@@ -274,7 +284,7 @@ models:
 ```
 
 `timeShare` is deprecated: a config that still has it loads with a warning, `period` becomes
-`batch.cycle`, `linger` becomes `batch.linger` (how long an idle model waits for more work before its
+`batch.maxCycle`, `linger` becomes `batch.linger` (how long an idle model waits for more work before its
 turn ends, default `2s`), and `minSlice` is ignored.
 
 ## Risks

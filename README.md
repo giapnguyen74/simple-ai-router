@@ -33,9 +33,15 @@ curl localhost:8080/v1/chat/completions \
 ## Scheduling
 
 Every request is a ticket, **booked into a batch** when it arrives. A batch is
-about `batch.cycle` long and is shared, by `share`, among the models booked in
-it; each model runs its part in one turn, so it is loaded at most once per
-batch, and the model already loaded goes first in the next batch.
+shared, by `share`, among the models booked in it; each model runs its part in
+one turn, so it is loaded at most once per batch, and the model already loaded
+goes first in the next batch.
+
+A batch's length **adapts** to what is booked in it: long enough that loading
+its models takes at most `maxSwitchOverhead` of it, and that its longest job
+fits, between `minCycle` and `maxCycle`. With loads of 39 s and 13 s at 10 %,
+a batch of both is about 9 minutes; one model after another that loads in
+13 s gets `minCycle`; a batch holding a 25-minute render stretches to it.
 
 - A ticket costs its estimate: the workload's `eta_s` from `validate`, else
   the learned duration of its model and path, else `defaultEta`. What the
@@ -55,7 +61,7 @@ model, `concurrency` caps what runs at once, `maxQueue` refuses more waiting
 requests with `429`, and `queueTimeout` gives up with `503`.
 
 ```yaml
-batch: {cycle: 15m, linger: 2s}   # defaults
+batch: {minCycle: 2m, maxCycle: 30m, maxSwitchOverhead: 0.1, linger: 2s}   # defaults
 models:
   qwen-7b:
     share: 3

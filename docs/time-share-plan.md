@@ -2,7 +2,7 @@
 
 Status: **jobs implemented; the slice scheduler is replaced** by the batch
 scheduler of [time-share-v2-plan.md](time-share-v2-plan.md) (`timeShare` is
-still read: `period` becomes `batch.cycle`). The jobs part below is current;
+still read: `period` becomes `batch.maxCycle`). The jobs part below is current;
 the workload side lives in `simple-ai-server/GUIDELINE.md`.
 
 ## Problem it solves

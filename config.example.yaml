@@ -7,11 +7,14 @@ healthCheckTimeout: 120s
 # How long a swap waits for in-flight requests on the outgoing model.
 drainTimeout: 5m
 # Batch scheduler for models that have work at the same time (defaults shown).
-# Work is booked into batches of about one cycle; each model runs its part of a
-# batch in one turn, so it is loaded at most once per batch.
+# Work is booked into batches; each model runs its part of a batch in one turn,
+# so it is loaded at most once per batch. A batch's length adapts: loading its
+# models takes at most maxSwitchOverhead of it, and its longest job fits.
 batch:
-  cycle: 15m      # target length of one batch
-  linger: 2s      # an idle model waits this long for more work before its turn ends
+  minCycle: 2m              # shortest batch
+  maxCycle: 30m             # longest batch: bounds how long other models wait
+  maxSwitchOverhead: 0.1    # model loads take at most 10% of a batch
+  linger: 2s                # an idle model waits this long for more work before its turn ends
 # The router's job store (defaults shown). One folder per job: <dir>/<model>/<id>/.
 jobs:
   dir: ./jobs             # relative to this file

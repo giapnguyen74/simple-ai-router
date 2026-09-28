@@ -148,6 +148,7 @@ type Router struct {
 	// model began to wait for a model that was alone), order its turns.
 	cur       int
 	curStart  time.Time
+	curCycle  time.Duration // the running batch's length
 	order     []*model
 	contended bool
 	epoch     int // bumped on every activation
@@ -554,7 +555,7 @@ func (r *Router) contentionLocked(a *model, now time.Time) {
 		if t.batch > r.cur {
 			break
 		}
-		if over || work+t.cost > r.cfg.Batch.Cycle && (work > 0 || a.admitted > 0) {
+		if over || work+t.cost > r.cfg.Batch.MinCycle && (work > 0 || a.admitted > 0) {
 			t.batch, over = r.cur+1, true // and every later one: arrival order
 			continue
 		}
@@ -562,6 +563,7 @@ func (r *Router) contentionLocked(a *model, now time.Time) {
 	}
 	r.rebalanceLocked(r.cur + 1)
 	r.fixDepsLocked()
+	r.curCycle, _ = r.cycleLocked(r.cur, r.demandLocked(r.cur), 0)
 	a.quota = max(work, tolerance)
 	a.turnAdmits = a.admitted
 	r.order = []*model{a}
@@ -574,7 +576,7 @@ func (r *Router) finishTurnLocked(a *model, now time.Time) {
 	a.turnDone = true
 	if !r.turnStart.IsZero() {
 		if over := now.Sub(r.turnStart) - a.quota; over > 0 {
-			a.debt = min(over, r.cfg.Batch.Cycle)
+			a.debt = min(over, r.cfg.Batch.MaxCycle)
 		}
 	}
 	r.pushBackLocked(a)
@@ -972,7 +974,10 @@ func (r *Router) Infos() []Info {
 
 // Schedule is the batch view of GET /running.
 type Schedule struct {
-	CycleS float64 `json:"cycle_s"`
+	// CycleS is the running batch's length; each batch adapts, up to
+	// MaxCycleS.
+	CycleS    float64 `json:"cycle_s"`
+	MaxCycleS float64 `json:"max_cycle_s"`
 	// ElapsedS is the running batch's age.
 	ElapsedS float64         `json:"elapsed_s"`
 	Batches  []BatchInfo     `json:"batches"`
@@ -983,6 +988,7 @@ type Schedule struct {
 // BatchInfo is one booked batch: 1 is the running one.
 type BatchInfo struct {
 	Batch    int         `json:"batch"`
+	CycleS   float64     `json:"cycle_s"`
 	StartsIn float64     `json:"starts_in_s"`
 	Models   []BatchPart `json:"models"`
 }
@@ -1036,11 +1042,17 @@ func (r *Router) Schedule() Schedule {
 			p.WorkS += secs(t.cost)
 		}
 	}
-	s := Schedule{CycleS: secs(r.cfg.Batch.Cycle), Paths: map[string]Path{}}
+	s := Schedule{CycleS: secs(r.curCycle), MaxCycleS: secs(r.cfg.Batch.MaxCycle), Paths: map[string]Path{}}
 	if !r.curStart.IsZero() && r.active != nil {
 		s.ElapsedS = secs(now.Sub(r.curStart))
 	}
 	for k, b := range byBatch {
+		if abs := k + r.cur - 1; k == 1 {
+			b.CycleS = secs(r.curCycle)
+		} else {
+			c, _ := r.cycleLocked(abs, r.demandLocked(abs), 0)
+			b.CycleS = secs(c)
+		}
 		for _, p := range parts[k] {
 			b.Models = append(b.Models, *p)
 		}

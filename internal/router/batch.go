@@ -128,28 +128,48 @@ func (r *Router) demandLocked(k int) map[*model]time.Duration {
 	return d
 }
 
-// budgetLocked is the time a batch has for work: the cycle minus the loads
-// of its models. The model already loaded when the batch starts costs no
-// load; for the next batch that is the active model, for later ones the
-// guess is the slowest-loading model.
-func (r *Router) budgetLocked(k int, demand map[*model]time.Duration) time.Duration {
-	cycle := r.cfg.Batch.Cycle
-	budget := cycle
+// cycleLocked is the length of batch k, which adapts to what is booked in
+// it: long enough that loading its models takes at most maxSwitchOverhead of
+// it, and that its longest job fits, within minCycle and maxCycle. extra is
+// a ticket about to be booked in it. loads is what its model loads take:
+// the model already loaded when the batch starts costs none (the active
+// model, for the running and the next batch; for later ones the guess is
+// that it is the slowest-loading one).
+func (r *Router) cycleLocked(k int, demand map[*model]time.Duration, extra time.Duration) (cycle, loads time.Duration) {
+	b := r.cfg.Batch
 	var slowest time.Duration
 	carried := false
 	for m := range demand {
 		load := r.loadTimeLocked(m)
-		if k == r.cur+1 && m == r.active {
+		if (k == r.cur || k == r.cur+1) && m == r.active {
 			carried = true
 			continue
 		}
-		budget -= load
+		loads += load
 		slowest = max(slowest, load)
 	}
-	if !carried {
-		budget += slowest
+	if !carried && k > r.cur+1 {
+		loads -= slowest // the model loaded then is not known yet
 	}
-	return max(budget, cycle/4)
+	longest := extra
+	for _, m := range r.models {
+		for _, t := range m.queue {
+			if t.batch == k {
+				longest = max(longest, t.cost)
+			} else if t.batch > k {
+				break
+			}
+		}
+	}
+	amortized := time.Duration(float64(loads) / b.MaxSwitchOverhead)
+	cycle = min(max(b.MinCycle, amortized, longest+loads), b.MaxCycle)
+	return cycle, loads
+}
+
+// budgetLocked is the time batch k has for work: its cycle minus its loads.
+func (r *Router) budgetLocked(k int, demand map[*model]time.Duration, extra time.Duration) time.Duration {
+	cycle, loads := r.cycleLocked(k, demand, extra)
+	return max(cycle-loads, cycle/4)
 }
 
 // waterfill shares budget max-min fair by share: a model that needs less
@@ -212,7 +232,7 @@ func (r *Router) bookLocked(m *model, t *Ticket) []move {
 			continue // measure the first run before booking more on a guess
 		}
 		demand[m] += t.cost
-		if alloc := waterfill(demand, r.budgetLocked(k, demand)); demand[m] <= alloc[m]+tolerance {
+		if alloc := waterfill(demand, r.budgetLocked(k, demand, t.cost)); demand[m] <= alloc[m]+tolerance {
 			break
 		}
 	}
@@ -241,7 +261,7 @@ func (r *Router) rebalanceLocked(k int) []move {
 		if len(demand) == 0 {
 			return moves
 		}
-		alloc := waterfill(demand, r.budgetLocked(k, demand))
+		alloc := waterfill(demand, r.budgetLocked(k, demand, 0))
 		moved := false
 		for m, d := range demand {
 			for i := len(m.queue) - 1; i >= 0 && d > alloc[m]+tolerance; i-- {
@@ -310,7 +330,7 @@ func (r *Router) joinLocked(m *model, t *Ticket, now time.Time) bool {
 	if !r.curStart.IsZero() {
 		elapsed = now.Sub(r.curStart)
 	}
-	return elapsed+r.remainingLocked(now)+t.cost <= r.cfg.Batch.Cycle
+	return elapsed+r.remainingLocked(now)+t.cost <= r.curCycle
 }
 
 func (r *Router) inOrder(m *model) bool {
@@ -404,7 +424,8 @@ func (r *Router) startBatchLocked(k int, carry *model, now time.Time) {
 	r.cur, r.curStart = k, now
 	r.order = r.batchOrder(k, carry)
 	demand := r.demandLocked(k)
-	budget := r.budgetLocked(k, demand)
+	r.curCycle, _ = r.cycleLocked(k, demand, 0)
+	budget := r.budgetLocked(k, demand, 0)
 	alloc := waterfill(demand, budget)
 	shares := 0
 	for m := range demand {
@@ -425,7 +446,7 @@ func (r *Router) startBatchLocked(k int, carry *model, now time.Time) {
 	for i, m := range r.order {
 		names[i] = m.cfg.Name
 	}
-	slog.Info("batch starts", "batch", k, "order", names)
+	slog.Info("batch starts", "batch", k, "cycle", r.curCycle.Round(time.Second), "order", names)
 }
 
 // Place is where a waiting ticket stands: its batch (1 = the running one) and
