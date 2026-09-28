@@ -25,6 +25,13 @@ const (
 	defaultCheckEndpoint      = "/health"
 	defaultBusyInterval       = 2 * time.Second
 	defaultBusyGrace          = 15 * time.Second
+	defaultPeriod             = 10 * time.Minute
+	defaultMinSlice           = time.Minute
+	defaultLinger             = 2 * time.Second
+	defaultJobsDir            = "jobs"
+	defaultResultTTL          = 30 * 24 * time.Hour
+	defaultMaxBodySize        = 64 << 20
+	defaultProgressInterval   = time.Second
 )
 
 type Config struct {
@@ -34,10 +41,78 @@ type Config struct {
 	// DrainTimeout bounds how long a swap waits for in-flight requests on
 	// the outgoing model before killing it anyway.
 	DrainTimeout time.Duration           `yaml:"drainTimeout"`
+	TimeShare    TimeShare               `yaml:"timeShare"`
+	Jobs         Jobs                    `yaml:"jobs"`
 	Models       map[string]*ModelConfig `yaml:"models"`
 
 	// aliases maps an alias to its real model name. Built by Load.
 	aliases map[string]string
+}
+
+// TimeShare sizes the slice a model gets when several models have work.
+type TimeShare struct {
+	// Period is one full rotation when every model has work.
+	Period time.Duration `yaml:"period"`
+	// MinSlice is the shortest slice a loaded model gets while it has work.
+	MinSlice time.Duration `yaml:"minSlice"`
+	// Linger is how long an idle active model waits for more work before it
+	// yields to a waiting model. Nil means the default; a pointer so that
+	// an explicit 0s is not mistaken for unset.
+	Linger *time.Duration `yaml:"linger"`
+}
+
+// Jobs configures the router's job store.
+type Jobs struct {
+	// Dir holds one folder per job: <dir>/<model>/<job id>/. A relative path
+	// is resolved against the config file's directory.
+	Dir string `yaml:"dir"`
+	// ResultTTL is how long a finished job is kept.
+	ResultTTL time.Duration `yaml:"resultTTL"`
+	// MaxBodySize caps a stored job request.
+	MaxBodySize ByteSize `yaml:"maxBodySize"`
+}
+
+// ByteSize is a byte count: a plain number, or one with a KB, MB or GB
+// suffix (powers of 1024).
+type ByteSize int64
+
+func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error {
+	v, err := ParseByteSize(n.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %w", n.Line, err)
+	}
+	*b = v
+	return nil
+}
+
+func ParseByteSize(s string) (ByteSize, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(t, u.suffix) {
+			t, mult = strings.TrimSpace(strings.TrimSuffix(t, u.suffix)), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, 64)
+	if err != nil || n < 0 || n > (1<<62)/mult {
+		return 0, fmt.Errorf("invalid size %q (want bytes, or a number with KB, MB or GB)", s)
+	}
+	return ByteSize(n * mult), nil
+}
+
+// Endpoint names one path on the model server.
+type Endpoint struct {
+	Endpoint string `yaml:"endpoint"`
+}
+
+// Progress is polled while one of the model's jobs runs.
+type Progress struct {
+	Endpoint string        `yaml:"endpoint"`
+	Interval time.Duration `yaml:"interval"`
 }
 
 type ModelConfig struct {
@@ -57,6 +132,27 @@ type ModelConfig struct {
 	// resolved and never starts. It keeps its port slot so the other
 	// models' ports do not shift.
 	Disabled bool `yaml:"disabled"`
+
+	// Share weighs this model's slice against the others (default 1).
+	Share int `yaml:"share"`
+	// Concurrency caps the requests admitted at the same time (0 = no cap).
+	// Jobs run one at a time unless it is above 1.
+	Concurrency int `yaml:"concurrency"`
+	// MaxQueue caps the requests waiting in the router (0 = no cap).
+	MaxQueue int `yaml:"maxQueue"`
+	// QueueTimeout bounds how long a request waits to be admitted (0 = none).
+	QueueTimeout time.Duration `yaml:"queueTimeout"`
+	// JobTimeout bounds one job's run (0 = none).
+	JobTimeout time.Duration `yaml:"jobTimeout"`
+	// ResultTTL, KeepJobs and MaxBodySize override the jobs section.
+	// KeepJobs keeps only the newest N finished jobs (0 = no limit).
+	ResultTTL   time.Duration `yaml:"resultTTL"`
+	KeepJobs    int           `yaml:"keepJobs"`
+	MaxBodySize ByteSize      `yaml:"maxBodySize"`
+	// Linger overrides timeShare.linger.
+	Linger   *time.Duration `yaml:"linger"`
+	Progress *Progress      `yaml:"progress"`
+	Validate *Endpoint      `yaml:"validate"`
 
 	// Filled in by Load.
 	Name string   `yaml:"-"`
@@ -96,15 +192,18 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	baseDir := filepath.Dir(path)
 	if strings.EqualFold(filepath.Ext(path), ".json") {
-		return ParseJSON(data)
+		return parseJSON(data, baseDir)
 	}
-	return Parse(data)
+	return parse(data, baseDir)
 }
 
 // ParseJSON parses a JSON config. Durations are strings such as "10s", as in
 // YAML.
-func ParseJSON(data []byte) (*Config, error) {
+func ParseJSON(data []byte) (*Config, error) { return parseJSON(data, "") }
+
+func parseJSON(data []byte, baseDir string) (*Config, error) {
 	// Check JSON syntax with encoding/json for precise errors, then decode
 	// through the YAML path so defaults, durations and unknown-field checks
 	// behave identically. JSON is valid YAML once re-serialized.
@@ -126,24 +225,27 @@ func ParseJSON(data []byte) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(out)
+	return parse(out, baseDir)
 }
 
-// Parse parses a YAML config.
-func Parse(data []byte) (*Config, error) {
+// Parse parses a YAML config. Relative paths in it are resolved against the
+// working directory.
+func Parse(data []byte) (*Config, error) { return parse(data, "") }
+
+func parse(data []byte, baseDir string) (*Config, error) {
 	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if err := c.finalize(); err != nil {
+	if err := c.finalize(baseDir); err != nil {
 		return nil, err
 	}
 	return &c, nil
 }
 
-func (c *Config) finalize() error {
+func (c *Config) finalize(baseDir string) error {
 	if c.Listen == "" {
 		c.Listen = defaultListen
 	}
@@ -158,6 +260,43 @@ func (c *Config) finalize() error {
 	}
 	if len(c.Models) == 0 {
 		return fmt.Errorf("config: no models defined")
+	}
+	ts := &c.TimeShare
+	if ts.Period == 0 {
+		ts.Period = defaultPeriod
+	}
+	if ts.MinSlice == 0 {
+		ts.MinSlice = min(defaultMinSlice, ts.Period)
+	}
+	if ts.Linger == nil {
+		d := defaultLinger
+		ts.Linger = &d
+	}
+	if ts.Period < 0 || ts.MinSlice < 0 || *ts.Linger < 0 {
+		return fmt.Errorf("config: timeShare durations must not be negative")
+	}
+	if ts.MinSlice > ts.Period {
+		return fmt.Errorf("config: timeShare.minSlice (%s) is longer than period (%s)", ts.MinSlice, ts.Period)
+	}
+	if c.Jobs.Dir == "" {
+		c.Jobs.Dir = defaultJobsDir
+	}
+	if !filepath.IsAbs(c.Jobs.Dir) {
+		c.Jobs.Dir = filepath.Join(baseDir, c.Jobs.Dir)
+	}
+	abs, err := filepath.Abs(c.Jobs.Dir)
+	if err != nil {
+		return fmt.Errorf("config: jobs.dir: %w", err)
+	}
+	c.Jobs.Dir = abs
+	if c.Jobs.ResultTTL == 0 {
+		c.Jobs.ResultTTL = defaultResultTTL
+	}
+	if c.Jobs.MaxBodySize == 0 {
+		c.Jobs.MaxBodySize = defaultMaxBodySize
+	}
+	if c.Jobs.ResultTTL < 0 {
+		return fmt.Errorf("config: jobs.resultTTL must not be negative")
 	}
 
 	// Sort names so port assignment is stable across restarts.
@@ -195,6 +334,40 @@ func (c *Config) finalize() error {
 			if b.Grace == 0 {
 				b.Grace = defaultBusyGrace
 			}
+		}
+		if m.Share == 0 {
+			m.Share = 1
+		}
+		if m.Share < 0 || m.Concurrency < 0 || m.MaxQueue < 0 || m.KeepJobs < 0 {
+			return fmt.Errorf("model %q: share, concurrency, maxQueue and keepJobs must not be negative", name)
+		}
+		if m.QueueTimeout < 0 || m.JobTimeout < 0 || m.ResultTTL < 0 {
+			return fmt.Errorf("model %q: queueTimeout, jobTimeout and resultTTL must not be negative", name)
+		}
+		if m.ResultTTL == 0 {
+			m.ResultTTL = c.Jobs.ResultTTL
+		}
+		if m.MaxBodySize == 0 {
+			m.MaxBodySize = c.Jobs.MaxBodySize
+		}
+		if m.Linger == nil {
+			m.Linger = ts.Linger
+		} else if *m.Linger < 0 {
+			return fmt.Errorf("model %q: linger must not be negative", name)
+		}
+		if p := m.Progress; p != nil {
+			if !strings.HasPrefix(p.Endpoint, "/") {
+				return fmt.Errorf("model %q: progress needs an endpoint starting with /", name)
+			}
+			if p.Interval == 0 {
+				p.Interval = defaultProgressInterval
+			}
+			if p.Interval < 0 {
+				return fmt.Errorf("model %q: progress.interval must not be negative", name)
+			}
+		}
+		if v := m.Validate; v != nil && !strings.HasPrefix(v.Endpoint, "/") {
+			return fmt.Errorf("model %q: validate needs an endpoint starting with /", name)
 		}
 		if m.CheckEndpoint == "" {
 			m.CheckEndpoint = defaultCheckEndpoint

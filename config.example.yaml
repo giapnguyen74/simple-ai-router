@@ -6,6 +6,16 @@ startPort: 10001
 healthCheckTimeout: 120s
 # How long a swap waits for in-flight requests on the outgoing model.
 drainTimeout: 5m
+# Time-share between models that have work at the same time (defaults shown).
+timeShare:
+  period: 10m     # one full rotation when every model has work
+  minSlice: 1m    # a loaded model keeps the GPU at least this long while it has work
+  linger: 2s      # an idle model waits this long for more work before yielding
+# The router's job store (defaults shown). One folder per job: <dir>/<model>/<id>/.
+jobs:
+  dir: ./jobs             # relative to this file
+  resultTTL: 720h         # delete a finished job after 30 days
+  maxBodySize: 64MB       # per stored request
 
 models:
   qwen-7b:
@@ -15,6 +25,10 @@ models:
         --port ${PORT} -ngl 99 -c 8192
     aliases: [gpt-4o-mini]
     ttl: 10m               # unload after 10 minutes idle (0 = never)
+    share: 3               # three quarters of the period against a share-1 model
+    # concurrency: 0       # requests admitted at once (0 = no cap)
+    # maxQueue: 0          # waiting requests before 429 (0 = no cap)
+    # queueTimeout: 0      # give up waiting with 503 (0 = never)
     # disabled: true       # temporarily hide the model; it keeps its port slot
 
   bge-embed:
@@ -24,15 +38,35 @@ models:
     # checkEndpoint: /health            # default; "none" to skip
     # stopTimeout: 10s                  # SIGTERM -> SIGKILL grace period
 
-  # A job-queue server such as qwen-image-server:
-  # POST /jobs returns 202 at once and renders in the background, so the
-  # router asks /health whether it is still working before swapping it out.
-  # Reach it with /u/qwen-image/jobs, since it has no OpenAI API.
+  # A synchronous workload driven through the router's jobs:
+  #   POST /jobs/qwen-image/generate -> 202 {id}; GET /jobs/{id}/result -> the PNG.
+  # The router sends one job at a time with X-Job-Dir; the workload writes
+  # its file there and answers {"file": "image.png", "result": {...}}.
   qwen-image:
     cmd: uv run --directory /path/to/simple-ai-server/qwen-image qwen_image_server.py --port ${PORT}
     env: ["PYTHONUNBUFFERED=1"]   # keep Python log lines in order
     stopTimeout: 30s
-    drainTimeout: 30m             # a queue of 2K renders can take a while
+    drainTimeout: 30m             # a 2K render must be allowed to finish before a swap
+    share: 1
+    maxQueue: 16
+    jobTimeout: 1h
+    # keepJobs: 200               # keep only the newest 200 finished jobs
+    # maxBodySize: 200MB          # per-model override for large uploads
+    progress:
+      endpoint: /progress         # polled every interval while a job runs
+      interval: 1s
+    validate:
+      endpoint: /validate         # asked at submit when the model is loaded
+
+  # A legacy job-queue server that keeps its own queue: POST /jobs returns
+  # 202 at once and renders in the background, so the router asks /health
+  # whether it is still working before swapping it out. Reach it with
+  # /u/yue2/jobs, since it has no OpenAI API.
+  yue2:
+    cmd: uv run --directory /path/to/simple-ai-server/yue2 yue2_server.py --port ${PORT}
+    env: ["PYTHONUNBUFFERED=1"]
+    stopTimeout: 30s
+    drainTimeout: 30m
     busyCheck:
       endpoint: /health
       fields: [running, queued]   # busy while either is non-null / non-zero

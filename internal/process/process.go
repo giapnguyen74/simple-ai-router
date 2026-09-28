@@ -322,6 +322,10 @@ func (p *Process) sinceLastUsed() time.Duration {
 	return time.Since(p.lastUsed)
 }
 
+// WaitInflight blocks until no request is in flight, or until the timeout
+// elapses. It returns false on timeout.
+func (p *Process) WaitInflight(timeout time.Duration) bool { return p.waitInflight(timeout) }
+
 func (p *Process) waitInflight(timeout time.Duration) bool {
 	p.mu.Lock()
 	if p.inflight == 0 {

@@ -30,7 +30,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	})
 	rt := router.New(cfg, nil)
 	t.Cleanup(rt.Shutdown)
-	s, err := New(rt)
+	s, err := New(rt, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

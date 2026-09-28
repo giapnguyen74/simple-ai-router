@@ -12,10 +12,14 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/giapnguyen74/simple-ai-router/internal/jobs"
 	"github.com/giapnguyen74/simple-ai-router/internal/router"
 )
 
@@ -25,12 +29,14 @@ const maxBodySize = 64 << 20
 
 type Server struct {
 	router  *router.Router
+	jobs    *jobs.Manager
 	proxies map[string]*httputil.ReverseProxy
 	mux     *http.ServeMux
 }
 
-func New(r *router.Router) (*Server, error) {
-	s := &Server{router: r, proxies: make(map[string]*httputil.ReverseProxy), mux: http.NewServeMux()}
+// New builds the HTTP handler. jm may be nil: the job routes then answer 404.
+func New(r *router.Router, jm *jobs.Manager) (*Server, error) {
+	s := &Server{router: r, jobs: jm, proxies: make(map[string]*httputil.ReverseProxy), mux: http.NewServeMux()}
 	for name, m := range r.Config().Models {
 		target, err := url.Parse(m.Proxy)
 		if err != nil {
@@ -51,6 +57,14 @@ func New(r *router.Router) (*Server, error) {
 	}
 	s.mux.HandleFunc("GET /v1/models", s.handleModels)
 	s.mux.HandleFunc("/u/{model}/{path...}", s.handleUpstream)
+	if jm != nil {
+		s.mux.HandleFunc("POST /jobs/{model}/{path...}", s.handleJobSubmit)
+		s.mux.HandleFunc("GET /jobs", s.handleJobList)
+		s.mux.HandleFunc("GET /jobs/{id}", s.handleJobGet)
+		s.mux.HandleFunc("GET /jobs/{id}/wait", s.handleJobWait)
+		s.mux.HandleFunc("GET /jobs/{id}/result", s.handleJobResult)
+		s.mux.HandleFunc("DELETE /jobs/{id}", s.handleJobCancel)
+	}
 	s.mux.HandleFunc("GET /running", s.handleRunning)
 	s.mux.HandleFunc("POST /unload", s.handleUnload)
 	s.mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
@@ -106,6 +120,14 @@ func (s *Server) proxy(w http.ResponseWriter, r *http.Request, model string) {
 		switch {
 		case errors.Is(err, router.ErrUnknownModel):
 			writeError(w, http.StatusNotFound, "model not found: "+model)
+		case errors.Is(err, router.ErrQueueFull):
+			w.Header().Set("Retry-After", "10")
+			writeError(w, http.StatusTooManyRequests, "queue full for model "+model)
+		case errors.Is(err, router.ErrQueueTimeout):
+			w.Header().Set("Retry-After", "10")
+			writeError(w, http.StatusServiceUnavailable, "timed out waiting for model "+model)
+		case errors.Is(err, router.ErrShutdown):
+			writeError(w, http.StatusServiceUnavailable, err.Error())
 		case r.Context().Err() != nil:
 			// Client went away; nothing to write.
 		default:
@@ -171,7 +193,142 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleRunning(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"models": s.router.Infos()})
+	infos := s.router.Infos()
+	if s.jobs != nil {
+		counts := s.jobs.Counts()
+		for i := range infos {
+			infos[i].Jobs = counts[infos[i].Name]
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": infos})
+}
+
+func (s *Server) handleJobSubmit(w http.ResponseWriter, r *http.Request) {
+	v, err := s.jobs.Submit(jobs.Request{
+		Model:         r.PathValue("model"),
+		Method:        r.Method,
+		Path:          r.PathValue("path"),
+		Query:         r.URL.RawQuery,
+		ContentType:   r.Header.Get("Content-Type"),
+		ContentLength: r.ContentLength,
+		Body:          r.Body,
+	})
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, v)
+}
+
+func (s *Server) handleJobList(w http.ResponseWriter, r *http.Request) {
+	views, err := s.jobs.List(r.URL.Query().Get("model"))
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, views)
+}
+
+func (s *Server) handleJobGet(w http.ResponseWriter, r *http.Request) {
+	v, err := s.jobs.Get(r.PathValue("id"))
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) handleJobWait(w http.ResponseWriter, r *http.Request) {
+	timeout := 300.0
+	if q := r.URL.Query().Get("timeout"); q != "" {
+		v, err := strconv.ParseFloat(q, 64)
+		if err != nil || !(v >= 0 && v <= 3600) {
+			writeDetail(w, http.StatusUnprocessableEntity, "timeout must be 0-3600 seconds")
+			return
+		}
+		timeout = v
+	}
+	v, err := s.jobs.Wait(r.Context(), r.PathValue("id"), time.Duration(timeout*float64(time.Second)))
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	v, err := s.jobs.Cancel(r.PathValue("id"))
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+// resultTypes names the content types of the usual outputs; the system's
+// MIME table differs between machines.
+var resultTypes = map[string]string{
+	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+	".webm": "video/webm", ".mp4": "video/mp4",
+	".flac": "audio/flac", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+	".zip": "application/zip", ".json": "application/json", ".txt": "text/plain; charset=utf-8",
+}
+
+func (s *Server) handleJobResult(w http.ResponseWriter, r *http.Request) {
+	path, name, err := s.jobs.Result(r.PathValue("id"))
+	if err != nil {
+		writeJobError(w, err)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "the output of this job is gone")
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	ctype := resultTypes[ext]
+	if ctype == "" {
+		ctype = mime.TypeByExtension(ext)
+	}
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
+	http.ServeContent(w, r, "", info.ModTime(), f)
+}
+
+// writeJobError answers a job route's error: the router's own as
+// {"detail": ...}, a workload's refusal as the workload sent it.
+func writeJobError(w http.ResponseWriter, err error) {
+	var reply *jobs.UpstreamReply
+	if errors.As(err, &reply) {
+		if reply.ContentType != "" {
+			w.Header().Set("Content-Type", reply.ContentType)
+		}
+		w.WriteHeader(reply.Status)
+		w.Write(reply.Body)
+		return
+	}
+	var je *jobs.Error
+	if errors.As(err, &je) {
+		if je.Status == http.StatusTooManyRequests || je.Status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "10")
+		}
+		writeDetail(w, je.Status, je.Detail)
+		return
+	}
+	writeDetail(w, http.StatusInternalServerError, err.Error())
+}
+
+func writeDetail(w http.ResponseWriter, status int, detail string) {
+	writeJSON(w, status, map[string]any{"detail": detail})
 }
 
 func (s *Server) handleUnload(w http.ResponseWriter, r *http.Request) {

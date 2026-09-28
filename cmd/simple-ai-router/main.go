@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/giapnguyen74/simple-ai-router/internal/config"
+	"github.com/giapnguyen74/simple-ai-router/internal/jobs"
 	"github.com/giapnguyen74/simple-ai-router/internal/router"
 	"github.com/giapnguyen74/simple-ai-router/internal/server"
 )
@@ -51,8 +52,13 @@ func run(configPath, listen string) error {
 	}
 
 	rt := router.New(cfg, os.Stderr)
-	srv, err := server.New(rt)
+	jm, err := jobs.New(rt)
 	if err != nil {
+		return err
+	}
+	srv, err := server.New(rt, jm)
+	if err != nil {
+		jm.Close()
 		return err
 	}
 
@@ -67,12 +73,13 @@ func run(configPath, listen string) error {
 	}
 	errc := make(chan error, 1)
 	go func() {
-		slog.Info("listening", "addr", cfg.Listen, "version", version, "models", len(cfg.Models))
+		slog.Info("listening", "addr", cfg.Listen, "version", version, "models", len(cfg.Models), "jobs", cfg.Jobs.Dir)
 		errc <- httpSrv.ListenAndServe()
 	}()
 
 	select {
 	case err := <-errc:
+		jm.Close()
 		rt.Shutdown()
 		return err
 	case <-ctx.Done():
@@ -85,6 +92,8 @@ func run(configPath, listen string) error {
 		slog.Warn("http shutdown", "err", err)
 	}
 	httpSrv.Close()
+	// Jobs first: queued ones keep their place on disk for the next start.
+	jm.Close()
 	rt.Shutdown()
 	return nil
 }

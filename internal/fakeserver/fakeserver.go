@@ -9,18 +9,171 @@
 //	FAKE_START_DELAY   delay before /health returns 200 (e.g. "500ms")
 //	FAKE_EXIT_AT_START exit with status 1 right away
 //	FAKE_IGNORE_TERM   ignore SIGTERM, forcing a SIGKILL
+//	FAKE_IGNORE_DISCONNECT  a job keeps running after its client hung up
+//
+// As a synchronous workload for the router's jobs it serves:
+//
+//	POST /job       runs for ?for=300ms, writes ?file= (default out.txt, holding
+//	                the server name and the request body) into X-Job-Dir and
+//	                answers {"file", "result"}. ?file= may be any name, also a
+//	                bad one; ?nofile=1 names a file without writing it;
+//	                ?steps=N sets what /progress reports
+//	POST /fail      answers ?status= (default 500) with {"detail": ...};
+//	                ?detail=list makes the detail a list
+//	POST /validate  422 when the body contains "invalid", else 200
+//	GET  /progress  {"busy", "id", "phase", "step", "steps", "eta_s"}
+//	GET  /stats     counters: jobs, disconnects, validates, maxConcurrent
 package fakeserver
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
+
+// Stats is what GET /stats returns.
+type Stats struct {
+	Jobs          int `json:"jobs"`
+	Disconnects   int `json:"disconnects"`
+	Validates     int `json:"validates"`
+	MaxConcurrent int `json:"maxConcurrent"`
+}
+
+// workload is the synchronous job side of the fake server.
+type workload struct {
+	name string
+
+	mu      sync.Mutex
+	stats   Stats
+	running int
+	id      string
+	step    int
+	steps   int
+}
+
+func (wl *workload) register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /job", wl.job)
+	mux.HandleFunc("POST /fail", func(w http.ResponseWriter, r *http.Request) {
+		status, _ := strconv.Atoi(r.URL.Query().Get("status"))
+		if status == 0 {
+			status = http.StatusInternalServerError
+		}
+		var detail any = "boom from " + wl.name
+		if r.URL.Query().Get("detail") == "list" {
+			detail = []map[string]any{{"loc": []string{"body", "steps"}, "msg": "too many"}}
+		}
+		writeJSON(w, status, map[string]any{"detail": detail})
+	})
+	mux.HandleFunc("POST /validate", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		wl.mu.Lock()
+		wl.stats.Validates++
+		wl.mu.Unlock()
+		if strings.Contains(string(body), "invalid") {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": "invalid request"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{})
+	})
+	mux.HandleFunc("GET /progress", func(w http.ResponseWriter, r *http.Request) {
+		wl.mu.Lock()
+		defer wl.mu.Unlock()
+		if wl.running == 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"busy": false})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"busy": true, "id": wl.id, "phase": "sampling",
+			"step": wl.step, "steps": wl.steps, "eta_s": wl.steps - wl.step})
+	})
+	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
+		wl.mu.Lock()
+		defer wl.mu.Unlock()
+		writeJSON(w, http.StatusOK, wl.stats)
+	})
+}
+
+func (wl *workload) job(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	body, _ := io.ReadAll(r.Body)
+	d, _ := time.ParseDuration(q.Get("for"))
+	steps, _ := strconv.Atoi(q.Get("steps"))
+	steps = max(steps, 1)
+	id, dir := r.Header.Get("X-Job-Id"), r.Header.Get("X-Job-Dir")
+
+	wl.mu.Lock()
+	wl.stats.Jobs++
+	wl.running++
+	wl.stats.MaxConcurrent = max(wl.stats.MaxConcurrent, wl.running)
+	wl.id, wl.step, wl.steps = id, 0, steps
+	wl.mu.Unlock()
+	defer func() {
+		wl.mu.Lock()
+		wl.running--
+		wl.mu.Unlock()
+	}()
+
+	ignore := os.Getenv("FAKE_IGNORE_DISCONNECT") == "1"
+	gone := false
+	for i := range steps {
+		select {
+		case <-time.After(d / time.Duration(steps)):
+		case <-r.Context().Done():
+			if !gone {
+				gone = true
+				wl.mu.Lock()
+				wl.stats.Disconnects++
+				wl.mu.Unlock()
+			}
+			if !ignore {
+				return
+			}
+			time.Sleep(d / time.Duration(steps))
+		}
+		wl.mu.Lock()
+		wl.step = i + 1
+		wl.mu.Unlock()
+	}
+
+	file := q.Get("file")
+	if file == "" {
+		file = "out.txt"
+	}
+	if dir == "" {
+		// No router: the answer is the file itself.
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "%s:%s", wl.name, body)
+		return
+	}
+	if q.Get("nofile") != "1" {
+		path := filepath.Join(dir, file)
+		os.MkdirAll(filepath.Dir(path), 0o755)
+		if err := os.WriteFile(path, []byte(wl.name+":"+string(body)), 0o644); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"file": file,
+		"result": map[string]any{"server": wl.name, "id": id, "bytes": len(body),
+			"contentType": r.Header.Get("Content-Type"), "query": r.URL.RawQuery},
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
 
 func MaybeRun() {
 	if os.Getenv("FAKE_SERVER") != "1" {
@@ -79,6 +232,7 @@ func run() {
 		running := time.Now().UnixNano() < busyUntil.Load()
 		fmt.Fprintf(w, `{"status":"ok","running":%t,"queued":0}`, running)
 	})
+	(&workload{name: name}).register(mux)
 	mux.HandleFunc("/whoami", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s %s", name, r.URL.Path)
 	})
